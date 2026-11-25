@@ -1,0 +1,45 @@
+# Maintainer: dralk <https://github.com/dralkh>
+pkgname=plasma6-applets-oasis
+pkgver=1.2.0
+pkgrel=1
+pkgdesc="KDE Plasma 6 panel widget for AI coding CLI usage limits, reset credits, subscription countdowns & AI Intel (Codex, Claude Code, Antigravity, OpenCode Go, Qwen, Cursor, Kimi, Grok, Muse)"
+arch=('any')
+url="https://github.com/dralkh/oasis"
+license=('MIT')
+depends=('plasma-workspace' 'python')
+optdepends=(
+    'libsecret: Secret Service keyring lookup for Antigravity, Cursor, and Muse Code'
+    'libnotify: desktop notifications when a usage window reaches 100%'
+)
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/dralkh/oasis/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    cd "oasis-${pkgver}"
+    local dest="${pkgdir}/usr/share/plasma/plasmoids/org.dralk.ailimits"
+    install -dm755 "${dest}"
+    cp -a package/. "${dest}/"
+    find "${dest}" -type d -name '__pycache__' -exec rm -rf {} +
+    chmod 755 "${dest}/contents/code/ai_limits.py" \
+              "${dest}/contents/code/oasisctl.py" \
+              "${dest}/contents/code/oasis_intel.py"
+
+    install -Dm644 package/contents/icons/ai-limits.svg \
+        "${pkgdir}/usr/share/icons/hicolor/scalable/apps/org.dralk.ailimits.svg"
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
+    install -dm755 "${pkgdir}/usr/share/applications"
+    cat > "${pkgdir}/usr/share/applications/org.dralk.ailimits.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Oasis
+Comment=AI subscription usage limits in the KDE Plasma panel
+Exec=python3 /usr/share/plasma/plasmoids/org.dralk.ailimits/contents/code/oasisctl.py launch
+Icon=org.dralk.ailimits
+Terminal=false
+Categories=Utility;
+Keywords=Oasis;AI;usage;quota;limits;Claude;Codex;Antigravity;Cursor;OpenCode;Qwen;
+StartupNotify=false
+EOF
+    chmod 644 "${pkgdir}/usr/share/applications/org.dralk.ailimits.desktop"
+}

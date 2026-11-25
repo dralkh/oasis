@@ -1,0 +1,37 @@
+name: Release Plasmoid
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Python helpers
+        run: |
+          python3 -m py_compile package/contents/code/ai_limits.py package/contents/code/oasisctl.py package/contents/code/oasis_intel.py
+
+      - name: Build .plasmoid archive
+        run: |
+          chmod +x build-plasmoid.sh
+          ./build-plasmoid.sh
+
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.plasmoid dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$TAG" dist/*.plasmoid dist/SHA256SUMS.txt \
+              --title "Oasis ${TAG}" \
+              --generate-notes
+          fi
