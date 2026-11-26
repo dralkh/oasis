@@ -1,0 +1,58 @@
+name: CI Verification
+
+on:
+  push:
+    branches: ["main", "feat/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Qt6 QML linter
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qt6-declarative-dev-tools
+
+      - name: Install test & lint tooling
+        run: python3 -m pip install --no-cache-dir pytest ruff
+
+      - name: Byte-compile Python helpers
+        run: |
+          python3 -m py_compile \
+            package/contents/code/ai_limits.py \
+            package/contents/code/oasis_accounts.py \
+            package/contents/code/oasis_proxy.py \
+            package/contents/code/oasisctl.py \
+            package/contents/code/oasis_intel.py
+
+      - name: Static lint (ruff)
+        run: ruff check package/contents/code/ tests/
+
+      - name: Shell script syntax & XML config checks
+        run: |
+          sh -n install.sh
+          sh -n uninstall.sh
+          sh -n build-plasmoid.sh
+          python3 -c 'import xml.etree.ElementTree as ET; ET.parse("package/contents/config/main.xml")'
+
+      - name: Automated unit, credential regression, security & packaging tests
+        run: pytest -v tests/
+
+      - name: Build & verify reproducible .plasmoid package
+        run: |
+          chmod +x build-plasmoid.sh
+          OASIS_SKIP_PROXY_BUILD=1 ./build-plasmoid.sh
+          cp dist/SHA256SUMS.txt /tmp/sha_first.txt
+          OASIS_SKIP_PROXY_BUILD=1 ./build-plasmoid.sh
+          diff -u /tmp/sha_first.txt dist/SHA256SUMS.txt
+          (cd dist && sha256sum -c SHA256SUMS.txt)

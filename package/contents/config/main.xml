@@ -32,5 +32,14 @@
     <entry name="helperPath" type="String">
       <default></default>
     </entry>
+    <entry name="proxyPort" type="Int">
+      <default>8317</default>
+    </entry>
+    <entry name="proxyBinaryPath" type="String">
+      <default></default>
+    </entry>
+    <entry name="showProxyStats" type="Bool">
+      <default>true</default>
+    </entry>
   </group>
 </kcfg>

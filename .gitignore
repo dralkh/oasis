@@ -2,5 +2,8 @@
 __pycache__/
 *.pyc
 .ruff_cache/
+.pytest_cache/
 *.plasmoid
 dist/
+proxy/target/
+package/contents/bin/oasis-proxy

@@ -23,6 +23,13 @@ Item {
     property string accountNotice: ""
     property bool accountsOpen: false
     property string accountsProviderId: "codex"
+    property bool proxyOpen: false
+    property var proxyState: null
+    property var proxyIntelPreview: null
+    property bool proxyBusy: false
+    property string proxyError: ""
+    property string proxyNotice: ""
+    property bool showProxyStats: true
 
     signal refreshRequested()
     signal quitRequested()
@@ -32,18 +39,46 @@ Item {
     signal switchAccountRequested(string providerId, string accountId)
     signal snapshotAccountRequested(string providerId, string label)
     signal launchLoginRequested(string providerId, string label)
-    signal addApiKeyRequested(string providerId, string label, string apiKey, string region)
+    signal addApiKeyPromptRequested(string providerId, string label, string region)
     signal renameAccountRequested(string providerId, string accountId, string newLabel)
     signal removeAccountRequested(string providerId, string accountId)
     signal clearAccountMessagesRequested()
+    signal proxyStatusRequested()
+    signal proxyModeRequested(string mode)
+    signal proxyStartRequested()
+    signal proxyStopRequested()
+    signal proxyRestartRequested()
+    signal proxyCopyEndpointRequested()
+    signal proxyCopyClientKeyRequested()
+    signal proxyRotateKeyRequested()
+    signal proxyRoutingChanged(var patch)
+    signal proxyPinAccountRequested(string providerId, string accountId)
+    signal proxyUnpinAccountRequested(string providerId)
+    signal proxyToggleAccountRequested(string accountId, bool disabled)
+    signal proxyResetCooldownRequested(string accountId)
+    signal proxyLaunchLoginRequested(string providerId)
+    signal proxyProviderDefaultRequested(string providerId, string model, string thinking)
+    signal proxySetTierRequested(string tier, string model, string thinking, bool clear)
+    signal proxyCopyTierEndpointRequested(string tier)
+    signal proxyImportIntelPreviewRequested()
+    signal proxyImportIntelApplyRequested()
+    signal proxyClearIntelPreviewRequested()
 
     function openAccounts(providerId) {
         if (providerId && providerId.length > 0) {
             full.accountsProviderId = providerId
         }
         full.intelOpen = false
+        full.proxyOpen = false
         full.accountsOpen = true
         full.clearAccountMessagesRequested()
+    }
+
+    function openProxy() {
+        full.intelOpen = false
+        full.accountsOpen = false
+        full.proxyOpen = true
+        full.proxyStatusRequested()
     }
 
     readonly property color mutedColor: Qt.rgba(Kirigami.Theme.textColor.r,
@@ -91,19 +126,56 @@ Item {
 
     Layout.minimumWidth: full.intelOpen
         ? Kirigami.Units.gridUnit * 28
-        : (full.accountsOpen ? Kirigami.Units.gridUnit * 26 : Kirigami.Units.gridUnit * 24)
+        : ((full.accountsOpen || full.proxyOpen) ? Kirigami.Units.gridUnit * 26 : Kirigami.Units.gridUnit * 24)
     Layout.preferredWidth: full.intelOpen
         ? Kirigami.Units.gridUnit * 31
-        : (full.accountsOpen ? Kirigami.Units.gridUnit * 28 : Kirigami.Units.gridUnit * 26)
-    Layout.minimumHeight: Math.min(Layout.preferredHeight, maxPopupHeight)
+        : ((full.accountsOpen || full.proxyOpen) ? Kirigami.Units.gridUnit * 28 : Kirigami.Units.gridUnit * 26)
+    Layout.minimumHeight: (full.intelOpen || full.accountsOpen || full.proxyOpen)
+        ? Kirigami.Units.gridUnit * 18
+        : Math.min(Layout.preferredHeight, maxPopupHeight)
     Layout.preferredHeight: full.intelOpen
         ? Kirigami.Units.gridUnit * 30
-        : (full.accountsOpen
-            ? Kirigami.Units.gridUnit * 29
+        : ((full.accountsOpen || full.proxyOpen)
+            ? Kirigami.Units.gridUnit * 30
             : Math.min(
                 Math.max(content.implicitHeight + popupMargin * 2, Kirigami.Units.gridUnit * 6),
                 maxPopupHeight))
     Layout.maximumHeight: Layout.preferredHeight
+
+    ProxyPanel {
+        id: proxyView
+        anchors.fill: parent
+        anchors.margins: full.popupMargin
+        visible: full.proxyOpen
+        proxyState: full.proxyState
+        intelPreview: full.proxyIntelPreview
+        busy: full.proxyBusy
+        errorText: full.proxyError
+        noticeText: full.proxyNotice
+        showStats: full.showProxyStats
+        onBackRequested: full.proxyOpen = false
+        onRefreshRequested: full.proxyStatusRequested()
+        onQuitRequested: full.quitRequested()
+        onModeRequested: function(m) { full.proxyModeRequested(m) }
+        onStartRequested: full.proxyStartRequested()
+        onStopRequested: full.proxyStopRequested()
+        onRestartRequested: full.proxyRestartRequested()
+        onCopyEndpointRequested: full.proxyCopyEndpointRequested()
+        onCopyClientKeyRequested: full.proxyCopyClientKeyRequested()
+        onRotateKeyRequested: full.proxyRotateKeyRequested()
+        onRoutingChanged: function(p) { full.proxyRoutingChanged(p) }
+        onPinAccountRequested: function(p, a) { full.proxyPinAccountRequested(p, a) }
+        onUnpinAccountRequested: function(p) { full.proxyUnpinAccountRequested(p) }
+        onToggleAccountRequested: function(a, d) { full.proxyToggleAccountRequested(a, d) }
+        onResetCooldownRequested: function(a) { full.proxyResetCooldownRequested(a) }
+        onLaunchProxyLoginRequested: function(p) { full.proxyLaunchLoginRequested(p) }
+        onProviderDefaultChanged: function(p, m, t) { full.proxyProviderDefaultRequested(p, m, t) }
+        onSetTierRequested: function(t, m, th, c) { full.proxySetTierRequested(t, m, th, c) }
+        onCopyTierEndpointRequested: function(t) { full.proxyCopyTierEndpointRequested(t) }
+        onImportIntelPreviewRequested: full.proxyImportIntelPreviewRequested()
+        onImportIntelApplyRequested: full.proxyImportIntelApplyRequested()
+        onClearIntelPreviewRequested: full.proxyClearIntelPreviewRequested()
+    }
 
     IntelModal {
         id: intelView
@@ -139,7 +211,7 @@ Item {
         onSwitchAccountRequested: function(p, a) { full.switchAccountRequested(p, a) }
         onSnapshotAccountRequested: function(p, l) { full.snapshotAccountRequested(p, l) }
         onLaunchLoginRequested: function(p, l) { full.launchLoginRequested(p, l) }
-        onAddApiKeyRequested: function(p, l, k, r) { full.addApiKeyRequested(p, l, k, r) }
+        onAddApiKeyPromptRequested: function(p, l, r) { full.addApiKeyPromptRequested(p, l, r) }
         onRenameAccountRequested: function(p, a, l) { full.renameAccountRequested(p, a, l) }
         onRemoveAccountRequested: function(p, a) { full.removeAccountRequested(p, a) }
     }
@@ -148,7 +220,7 @@ Item {
         id: content
         anchors.fill: parent
         anchors.margins: full.popupMargin
-        visible: !full.intelOpen && !full.accountsOpen
+        visible: !full.intelOpen && !full.accountsOpen && !full.proxyOpen
         spacing: 4
 
         RowLayout {
@@ -170,6 +242,8 @@ Item {
                     : "updated " + F.updatedText(full.lastSuccess, full.nowMs)
                 color: full.mutedColor
                 font.pixelSize: 10
+                elide: Text.ElideRight
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 8
             }
 
             QQC2.ToolButton {
@@ -211,6 +285,62 @@ Item {
             }
 
             QQC2.ToolButton {
+                id: proxyButton
+                readonly property bool proxyUp: !!(full.proxyState && full.proxyState.health && full.proxyState.health.ready)
+                implicitHeight: 22
+                leftPadding: 6
+                rightPadding: 6
+                topPadding: 2
+                bottomPadding: 2
+                Accessible.name: "Local inference proxy"
+                onClicked: full.openProxy()
+
+                contentItem: RowLayout {
+                    spacing: 4
+                    Rectangle {
+                        visible: proxyButton.proxyUp
+                        implicitWidth: 6
+                        implicitHeight: 6
+                        radius: 3
+                        color: Kirigami.Theme.positiveTextColor
+                    }
+                    Kirigami.Icon {
+                        source: "network-server-symbolic"
+                        implicitWidth: 12
+                        implicitHeight: 12
+                        isMask: true
+                        color: proxyButton.hovered
+                            ? Kirigami.Theme.highlightColor
+                            : Kirigami.Theme.textColor
+                    }
+                    Text {
+                        text: full.proxyBusy ? "…" : "Proxy"
+                        color: proxyButton.hovered
+                            ? Kirigami.Theme.highlightColor
+                            : Kirigami.Theme.textColor
+                        font.pixelSize: 10
+                        font.bold: true
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+
+                background: Rectangle {
+                    radius: 4
+                    color: proxyButton.down
+                        ? Qt.rgba(Kirigami.Theme.highlightColor.r, Kirigami.Theme.highlightColor.g, Kirigami.Theme.highlightColor.b, 0.24)
+                        : proxyButton.hovered
+                            ? Qt.rgba(Kirigami.Theme.highlightColor.r, Kirigami.Theme.highlightColor.g, Kirigami.Theme.highlightColor.b, 0.16)
+                            : Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.08)
+                }
+
+                QQC2.ToolTip.text: proxyButton.proxyUp
+                    ? "Local CLI inference proxy (running on 127.0.0.1)"
+                    : "Optional local CLI inference proxy (Direct CLI mode when off)"
+                QQC2.ToolTip.visible: hovered
+                QQC2.ToolTip.delay: 500
+            }
+
+            QQC2.ToolButton {
                 id: intelButton
                 implicitHeight: 22
                 leftPadding: 6
@@ -219,6 +349,7 @@ Item {
                 bottomPadding: 2
                 onClicked: {
                     full.accountsOpen = false
+                    full.proxyOpen = false
                     full.intelOpen = true
                     full.intelLoadRequested()
                 }

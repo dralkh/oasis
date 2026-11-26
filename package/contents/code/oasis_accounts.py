@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import glob
 import hashlib
 import json
@@ -34,8 +35,9 @@ import subprocess
 import sys
 import time
 import urllib.parse
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 HOME = Path.home()
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (HOME / ".config"))
@@ -128,8 +130,15 @@ PROVIDER_SPECS: dict[str, dict[str, Any]] = {
 # ---------------------------------------------------------------------------
 
 
+def _reject_symlink(path: Path) -> None:
+    if path.is_symlink():
+        raise PermissionError(f"refusing symlink at sensitive path: {path.name}")
+
+
 def _ensure_private_dir(path: Path) -> None:
+    _reject_symlink(path)
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _reject_symlink(path)
     try:
         os.chmod(path, 0o700)
     except OSError:
@@ -138,8 +147,21 @@ def _ensure_private_dir(path: Path) -> None:
 
 def load_json(path: Path) -> Any:
     try:
-        with open(path, "rb") as fh:
-            raw = fh.read(MAX_FILE)
+        _reject_symlink(path)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        fd_owned = True
+        try:
+            fh = os.fdopen(fd, "rb")
+            fd_owned = False
+            with fh:
+                raw = fh.read(MAX_FILE)
+        finally:
+            if fd_owned:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         return json.loads(raw)
     except (OSError, ValueError, UnicodeDecodeError):
         return None
@@ -147,10 +169,16 @@ def load_json(path: Path) -> Any:
 
 def write_json_atomic(path: Path, data: Any, *, indent: Optional[int] = None, mode: int = 0o600) -> None:
     _ensure_private_dir(path.parent)
+    _reject_symlink(path)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, mode)
+    fd_owned = True
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+        fd_owned = False
+        with fh:
+            os.fchmod(fh.fileno(), mode)
             if indent is not None:
                 json.dump(data, fh, indent=indent, ensure_ascii=False)
                 fh.write("\n")
@@ -159,13 +187,35 @@ def write_json_atomic(path: Path, data: Any, *, indent: Optional[int] = None, mo
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
-        os.chmod(path, mode)
     except Exception:
+        if fd_owned:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
         raise
+
+
+@contextmanager
+def _vault_lock() -> Iterator[None]:
+    """Serialize all read-modify-write operations on Oasis's local account vault."""
+    _ensure_private_dir(VAULT_DIR)
+    lock_file = VAULT_DIR / ".vault.lock"
+    _reject_symlink(lock_file)
+    fd = os.open(lock_file, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def jwt_claims(token: str) -> dict[str, Any]:
@@ -316,11 +366,19 @@ def _save_index(index: dict[str, Any]) -> None:
 
 
 def _secret_path(provider: str, account_id: str) -> Path:
-    safe_provider = re.sub(r"[^a-z0-9_-]", "", provider.lower())
-    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "", account_id)
-    if not safe_provider or not safe_id:
-        raise ValueError("invalid provider or account_id")
-    return SECRETS_DIR / safe_provider / f"{safe_id}.json"
+    if provider not in PROVIDER_SPECS:
+        raise ValueError("invalid provider")
+    if not isinstance(account_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", account_id):
+        raise ValueError("invalid account_id")
+    candidate = SECRETS_DIR / provider / f"{account_id}.json"
+    _reject_symlink(SECRETS_DIR)
+    _reject_symlink(candidate.parent)
+    _reject_symlink(candidate)
+    resolved_base = SECRETS_DIR.resolve()
+    resolved_target = candidate.resolve()
+    if resolved_base not in resolved_target.parents:
+        raise ValueError("path escapes vault secrets directory")
+    return candidate
 
 
 def load_account_secret(provider: str, account_id: str) -> Optional[dict[str, Any]]:
@@ -578,7 +636,8 @@ def _describe_qwen(snap: dict[str, Any]) -> dict[str, Any]:
     email = claims.get("email") if isinstance(claims.get("email"), str) else ""
     sub = claims.get("sub") if isinstance(claims.get("sub"), str) else ""
     res_url = doc.get("resource_url") if isinstance(doc.get("resource_url"), str) else ""
-    identity = email.lower() or sub or doc.get("refresh_token") or access
+    tok_fallback = doc.get("refresh_token") or access
+    identity = email.lower() or sub or (sha256_hex(tok_fallback)[:16] if isinstance(tok_fallback, str) and tok_fallback else "")
     return {
         "email": email or None,
         "identity_key": f"qwen:{identity}" if identity else None,
@@ -626,7 +685,8 @@ def _describe_kimi(snap: dict[str, Any]) -> dict[str, Any]:
     email = claims.get("email") or claims.get("sub") or ""
     if not isinstance(email, str):
         email = ""
-    identity = email.lower() or doc.get("refresh_token") or access
+    tok_fallback = doc.get("refresh_token") or access
+    identity = email.lower() or (sha256_hex(tok_fallback)[:16] if isinstance(tok_fallback, str) and tok_fallback else "")
     return {
         "email": email if "@" in email else None,
         "identity_key": f"kimi:{identity}" if identity else None,
@@ -775,6 +835,8 @@ def apply_live_snapshot(provider: str, snap: dict[str, Any]) -> None:
         if not isinstance(oauth, dict):
             raise ValueError("missing claudeAiOauth in snapshot")
         locks = _claude_acquire_locks(config_dir)
+        if locks is None:
+            raise RuntimeError("Claude credential lock is busy (another Claude session is refreshing); retry shortly.")
         try:
             current_creds = load_json(creds_path)
             if not isinstance(current_creds, dict):
@@ -1011,7 +1073,7 @@ def _opencode_switch(account_id: str) -> dict[str, Any]:
     opencode_bin = find_bin("opencode", env)
     switched_via = "sqlite"
 
-    if opencode_bin and target["source"] == "opencode-db":
+    if opencode_bin and target["source"] == "opencode-db" and not account_id.startswith("-"):
         try:
             res = subprocess.run(
                 [opencode_bin, "auth", "switch", "opencode-go", account_id],
@@ -1161,18 +1223,7 @@ def _match_account(accounts: list[dict[str, Any]], desc: dict[str, Any], active_
     return None
 
 
-def sync_live_to_vault(provider: str, *, label_override: Optional[str] = None, auto_create: bool = True) -> Optional[dict[str, Any]]:
-    """Sync the currently active live CLI credential into the vault.
-
-    Returns the matched/created account metadata dict, or None if not signed in.
-    """
-    if provider == "opencodego":
-        rows = _opencode_list_rows(include_secrets=False)
-        return next((r for r in rows if r["active"]), None)
-
-    if provider not in PROVIDER_SPECS:
-        return None
-
+def _sync_live_to_vault_locked(provider: str, *, label_override: Optional[str] = None, auto_create: bool = True) -> Optional[dict[str, Any]]:
     snap = read_live_snapshot(provider)
     if not snap:
         return None
@@ -1236,6 +1287,22 @@ def sync_live_to_vault(provider: str, *, label_override: Optional[str] = None, a
     return dict(entry)
 
 
+def sync_live_to_vault(provider: str, *, label_override: Optional[str] = None, auto_create: bool = True) -> Optional[dict[str, Any]]:
+    """Sync the currently active live CLI credential into the vault.
+
+    Returns the matched/created account metadata dict, or None if not signed in.
+    """
+    if provider == "opencodego":
+        rows = _opencode_list_rows(include_secrets=False)
+        return next((r for r in rows if r["active"]), None)
+
+    if provider not in PROVIDER_SPECS:
+        return None
+
+    with _vault_lock():
+        return _sync_live_to_vault_locked(provider, label_override=label_override, auto_create=auto_create)
+
+
 def list_provider_accounts(provider: str, *, include_secrets: bool = False) -> dict[str, Any]:
     """Return structured account state for one provider (never leaks secrets unless internal)."""
     spec = PROVIDER_SPECS.get(provider)
@@ -1282,22 +1349,25 @@ def list_provider_accounts(provider: str, *, include_secrets: bool = False) -> d
     if matched is not None and live_snap is not None:
         active_id = matched["id"]
         active_label = matched.get("label") or live_desc["default_label"]
-        # Silently refresh vault snapshot if fingerprint/tokens changed on disk
-        if matched.get("fingerprint") != live_desc["fingerprint"]:
-            matched["fingerprint"] = live_desc["fingerprint"]
-            matched["updated_at"] = int(time.time())
-            if live_desc.get("email"):
-                matched["email"] = live_desc["email"]
-            bucket["active_id"] = active_id
+        # Silently refresh vault snapshot if fingerprint/tokens changed on disk (under vault lock)
+        if matched.get("fingerprint") != live_desc["fingerprint"] or bucket.get("active_id") != active_id:
             try:
-                save_account_secret(provider, active_id, live_snap)
-                _save_index(index)
-            except OSError:
-                pass
-        elif bucket.get("active_id") != active_id:
-            bucket["active_id"] = active_id
-            try:
-                _save_index(index)
+                with _vault_lock():
+                    fresh_index = _load_index()
+                    fresh_bucket = _provider_bucket(fresh_index, provider)
+                    fresh_matched = next(
+                        (a for a in fresh_bucket["accounts"] if a.get("id") == active_id),
+                        None,
+                    )
+                    if fresh_matched is not None:
+                        if fresh_matched.get("fingerprint") != live_desc["fingerprint"]:
+                            fresh_matched["fingerprint"] = live_desc["fingerprint"]
+                            fresh_matched["updated_at"] = int(time.time())
+                            if live_desc.get("email"):
+                                fresh_matched["email"] = live_desc["email"]
+                            save_account_secret(provider, active_id, live_snap)
+                        fresh_bucket["active_id"] = active_id
+                        _save_index(fresh_index)
             except OSError:
                 pass
 
@@ -1380,28 +1450,71 @@ def switch_account(provider: str, account_id: str) -> dict[str, Any]:
             raise ValueError("No active sign-in found to keep.")
         return {"ok": True, "provider": provider, "account_id": synced["id"], "label": synced["label"]}
 
-    # Step 1: Always sync current live credential into vault first so we never lose
-    # refreshed tokens or an unsaved manual login!
-    sync_live_to_vault(provider, auto_create=True)
+    with _vault_lock():
+        # Step 1: Always sync current live credential into vault first so we never lose
+        # refreshed tokens or an unsaved manual login!
+        # For Claude, acquire Claude Code's lock before snapshotting + swapping so a
+        # concurrent CLI OAuth rotation cannot slip between snapshot and overwrite.
+        if provider == "claude":
+            config_dir, creds_path, state_path = _claude_dirs()
+            locks = _claude_acquire_locks(config_dir)
+            if locks is None:
+                raise RuntimeError("Claude credential lock is busy (another Claude session is refreshing); retry shortly.")
+            try:
+                _sync_live_to_vault_locked(provider, auto_create=True)
+                index = _load_index()
+                bucket = _provider_bucket(index, provider)
+                target = next((a for a in bucket["accounts"] if a.get("id") == account_id), None)
+                if not target:
+                    raise ValueError(f"Account not found: {account_id}")
+                snap = load_account_secret(provider, account_id)
+                if not snap or not isinstance(snap.get("claudeAiOauth"), dict):
+                    raise ValueError(f"Saved credential missing for {target.get('label', account_id)}")
 
-    index = _load_index()
-    bucket = _provider_bucket(index, provider)
-    target = next((a for a in bucket["accounts"] if a.get("id") == account_id), None)
-    if not target:
-        raise ValueError(f"Account not found: {account_id}")
+                current_creds = load_json(creds_path)
+                if not isinstance(current_creds, dict):
+                    current_creds = {}
+                new_creds = dict(current_creds)
+                new_creds["claudeAiOauth"] = snap["claudeAiOauth"]
+                write_json_atomic(creds_path, new_creds, mode=0o600)
 
-    snap = load_account_secret(provider, account_id)
-    if not snap:
-        raise ValueError(f"Saved credential missing for {target.get('label', account_id)}")
+                current_state = load_json(state_path)
+                if isinstance(current_state, dict):
+                    new_state = dict(current_state)
+                    oauth_account = snap.get("oauthAccount")
+                    if isinstance(oauth_account, dict):
+                        new_state["oauthAccount"] = oauth_account
+                    else:
+                        new_state.pop("oauthAccount", None)
+                    write_json_atomic(state_path, new_state, indent=2, mode=0o600)
 
-    # Step 2: Apply target snapshot directly to the CLI's live credential store.
-    apply_live_snapshot(provider, snap)
+                bucket["active_id"] = account_id
+                target["updated_at"] = int(time.time())
+                _save_index(index)
+                label = str(target.get("label") or PROVIDER_SPECS[provider]["name"])
+            finally:
+                _claude_release_locks(locks)
+        else:
+            _sync_live_to_vault_locked(provider, auto_create=True)
 
-    bucket["active_id"] = account_id
-    target["updated_at"] = int(time.time())
-    _save_index(index)
+            index = _load_index()
+            bucket = _provider_bucket(index, provider)
+            target = next((a for a in bucket["accounts"] if a.get("id") == account_id), None)
+            if not target:
+                raise ValueError(f"Account not found: {account_id}")
 
-    label = str(target.get("label") or PROVIDER_SPECS[provider]["name"])
+            snap = load_account_secret(provider, account_id)
+            if not snap:
+                raise ValueError(f"Saved credential missing for {target.get('label', account_id)}")
+
+            # Step 2: Apply target snapshot directly to the CLI's live credential store.
+            apply_live_snapshot(provider, snap)
+
+            bucket["active_id"] = account_id
+            target["updated_at"] = int(time.time())
+            _save_index(index)
+            label = str(target.get("label") or PROVIDER_SPECS[provider]["name"])
+
     notify_desktop("Oasis — Account Switched", f"{PROVIDER_SPECS[provider]['name']} → {label}")
     return {
         "ok": True,
@@ -1431,10 +1544,6 @@ def add_api_key_account(
         notify_desktop("Oasis — Account Added", f"OpenCode Go → {res['label']}")
         return res
 
-    # Save current live login first so switching to the new API key doesn't lose it.
-    if activate:
-        sync_live_to_vault(provider, auto_create=True)
-
     default_region = (spec.get("regions") or ["international"])[0]
     chosen_region = (region or default_region).strip().lower()
     if spec.get("regions") and chosen_region not in spec["regions"]:
@@ -1443,31 +1552,36 @@ def add_api_key_account(
     snap = {"kind": "api_key", "api_key": clean_key, "region": chosen_region}
     desc = describe_snapshot(provider, snap)
 
-    index = _load_index()
-    bucket = _provider_bucket(index, provider)
-    now = int(time.time())
-    acc_id = _new_account_id()
-    acc_label = sanitize_label(label) or desc["default_label"]
+    with _vault_lock():
+        # Save current live login first so switching to the new API key doesn't lose it.
+        if activate:
+            _sync_live_to_vault_locked(provider, auto_create=True)
 
-    entry: dict[str, Any] = {
-        "id": acc_id,
-        "label": acc_label,
-        "email": None,
-        "identity_key": desc["identity_key"],
-        "fingerprint": desc["fingerprint"],
-        "kind": "api_key",
-        "region": chosen_region,
-        "created_at": now,
-        "updated_at": now,
-    }
-    bucket["accounts"].append(entry)
-    save_account_secret(provider, acc_id, snap)
+        index = _load_index()
+        bucket = _provider_bucket(index, provider)
+        now = int(time.time())
+        acc_id = _new_account_id()
+        acc_label = sanitize_label(label) or desc["default_label"]
 
-    if activate:
-        apply_live_snapshot(provider, snap)
-        bucket["active_id"] = acc_id
+        entry: dict[str, Any] = {
+            "id": acc_id,
+            "label": acc_label,
+            "email": None,
+            "identity_key": desc["identity_key"],
+            "fingerprint": desc["fingerprint"],
+            "kind": "api_key",
+            "region": chosen_region,
+            "created_at": now,
+            "updated_at": now,
+        }
+        bucket["accounts"].append(entry)
+        save_account_secret(provider, acc_id, snap)
 
-    _save_index(index)
+        if activate:
+            apply_live_snapshot(provider, snap)
+            bucket["active_id"] = acc_id
+
+        _save_index(index)
     notify_desktop("Oasis — Account Added", f"{spec['name']} → {acc_label}")
     return {"ok": True, "provider": provider, "account_id": acc_id, "label": acc_label}
 
@@ -1488,14 +1602,15 @@ def rename_account(provider: str, account_id: str, new_label: str) -> dict[str, 
             raise ValueError("No active sign-in found")
         return {"ok": True, "provider": provider, "account_id": synced["id"], "label": synced["label"]}
 
-    index = _load_index()
-    bucket = _provider_bucket(index, provider)
-    target = next((a for a in bucket["accounts"] if a.get("id") == account_id), None)
-    if not target:
-        raise ValueError(f"Account not found: {account_id}")
-    target["label"] = clean
-    target["updated_at"] = int(time.time())
-    _save_index(index)
+    with _vault_lock():
+        index = _load_index()
+        bucket = _provider_bucket(index, provider)
+        target = next((a for a in bucket["accounts"] if a.get("id") == account_id), None)
+        if not target:
+            raise ValueError(f"Account not found: {account_id}")
+        target["label"] = clean
+        target["updated_at"] = int(time.time())
+        _save_index(index)
     return {"ok": True, "provider": provider, "account_id": account_id, "label": clean}
 
 
@@ -1509,34 +1624,53 @@ def remove_account(provider: str, account_id: str) -> dict[str, Any]:
     if account_id == "__live__":
         raise ValueError("Live account is not saved in Oasis vault.")
 
-    index = _load_index()
-    bucket = _provider_bucket(index, provider)
-    before = len(bucket["accounts"])
-    bucket["accounts"] = [a for a in bucket["accounts"] if a.get("id") != account_id]
-    if len(bucket["accounts"]) == before:
-        raise ValueError(f"Account not found: {account_id}")
-    if bucket.get("active_id") == account_id:
-        bucket["active_id"] = None
-    delete_account_secret(provider, account_id)
-    _save_index(index)
+    with _vault_lock():
+        index = _load_index()
+        bucket = _provider_bucket(index, provider)
+        before = len(bucket["accounts"])
+        bucket["accounts"] = [a for a in bucket["accounts"] if a.get("id") != account_id]
+        if len(bucket["accounts"]) == before:
+            raise ValueError(f"Account not found: {account_id}")
+        if bucket.get("active_id") == account_id:
+            bucket["active_id"] = None
+        delete_account_secret(provider, account_id)
+        _save_index(index)
     return {"ok": True, "provider": provider, "account_id": account_id}
 
 
-def update_vault_claude_oauth(account_id: str, updated_oauth: dict[str, Any]) -> None:
-    """Persist refreshed Claude OAuth tokens back into an inactive vault snapshot."""
-    snap = load_account_secret("claude", account_id)
-    if not isinstance(snap, dict):
-        return
-    current = snap.get("claudeAiOauth")
-    if not isinstance(current, dict):
-        return
-    merged = dict(current)
-    merged.update(updated_oauth)
-    snap["claudeAiOauth"] = merged
-    try:
-        save_account_secret("claude", account_id, snap)
-    except OSError:
-        pass
+def update_vault_claude_oauth(
+    account_id: str,
+    updated_oauth: dict[str, Any],
+    *,
+    expected_refresh: Optional[str] = None,
+) -> None:
+    """Persist refreshed Claude OAuth tokens back into an inactive vault snapshot under vault lock + CAS."""
+    with _vault_lock():
+        snap = load_account_secret("claude", account_id)
+        if not isinstance(snap, dict):
+            return
+        current = snap.get("claudeAiOauth")
+        if not isinstance(current, dict):
+            return
+        cur_ref = current.get("refreshToken")
+        if expected_refresh and cur_ref not in ("", None, expected_refresh):
+            return
+        merged = dict(current)
+        merged.update(updated_oauth)
+        snap["claudeAiOauth"] = merged
+        try:
+            save_account_secret("claude", account_id, snap)
+            desc = _describe_claude(snap)
+            index = _load_index()
+            bucket = _provider_bucket(index, "claude")
+            for acc in bucket["accounts"]:
+                if acc.get("id") == account_id:
+                    acc["fingerprint"] = desc["fingerprint"]
+                    acc["updated_at"] = int(time.time())
+                    _save_index(index)
+                    break
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1730,6 +1864,106 @@ def run_login_interactive(provider: str, label: str = "") -> int:
     return 1 if rc != 0 else 0
 
 
+def prompt_add_api_key(
+    provider: str,
+    label: str = "",
+    region: str = "",
+    activate: bool = True,
+) -> dict[str, Any]:
+    """Prompt securely for an API key without passing the secret through process argv."""
+    spec = PROVIDER_SPECS.get(provider)
+    if not spec or not spec.get("supports_api_key"):
+        raise ValueError(f"Provider {provider} does not support API key accounts")
+
+    env = enriched_env()
+    kdialog = find_bin("kdialog", env)
+    if kdialog:
+        placeholder = spec.get("api_key_placeholder") or "API key"
+        prompt = f"Enter {spec['name']} API key ({placeholder}):"
+        res = subprocess.run(
+            [kdialog, "--title", f"Oasis — Add {spec['name']} API Key", "--password", prompt],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            return {"ok": False, "canceled": True, "error": "Canceled"}
+        raw_key = res.stdout.strip()
+        if not raw_key:
+            raise ValueError("API key cannot be empty")
+        out = add_api_key_account(
+            provider,
+            label,
+            raw_key,
+            region=region or None,
+            activate=activate,
+        )
+        out["state"] = list_provider_accounts(provider)
+        return out
+
+    term = _find_terminal(env)
+    if not term:
+        raise RuntimeError(
+            "Install kdialog or a terminal emulator, or run: oasis_accounts.py add-key --provider "
+            + provider
+            + " (reads key from stdin)."
+        )
+    term_name, prefix = term
+    script_path = str(Path(__file__).resolve())
+    runner_cmd = [sys.executable or "python3", script_path, "add-key-runner", "--provider", provider]
+    clean_label = sanitize_label(label)
+    if clean_label:
+        runner_cmd += ["--label", clean_label]
+    if region:
+        runner_cmd += ["--region", region]
+    if not activate:
+        runner_cmd += ["--no-activate"]
+    subprocess.Popen(
+        prefix + runner_cmd,
+        env=env,
+        cwd=str(HOME),
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return {
+        "ok": True,
+        "launched": True,
+        "provider": provider,
+        "terminal": term_name,
+        "message": f"Opened {term_name} to enter {spec['name']} API key securely.",
+    }
+
+
+def run_add_key_interactive(
+    provider: str,
+    label: str = "",
+    region: str = "",
+    activate: bool = True,
+) -> int:
+    """Interactive terminal fallback for adding an API key via getpass (zero argv exposure)."""
+    import getpass
+
+    spec = PROVIDER_SPECS.get(provider)
+    if not spec or not spec.get("supports_api_key"):
+        print(f"Provider {provider} does not support API key accounts.", file=sys.stderr)
+        return 2
+    print(f"=== Oasis: Add {spec['name']} API Key ===")
+    try:
+        raw_key = getpass.getpass(f"Paste {spec['name']} API key (input hidden): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCanceled.")
+        return 1
+    if not raw_key:
+        print("Empty API key — canceled.")
+        return 1
+    res = add_api_key_account(provider, label, raw_key, region=region or None, activate=activate)
+    print(f"\n✓ Added {spec['name']} account: {res['label']}")
+    time.sleep(1.0)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI entrypoint
 # ---------------------------------------------------------------------------
@@ -1757,6 +1991,21 @@ def main(argv: list[str]) -> int:
     p_key.add_argument("--region", default="")
     p_key.add_argument("--no-activate", action="store_true")
 
+    p_key_prompt = sub.add_parser(
+        "add-key-prompt",
+        help="Prompt securely via kdialog or terminal getpass (never exposes key in argv)",
+    )
+    p_key_prompt.add_argument("--provider", required=True)
+    p_key_prompt.add_argument("--label", default="")
+    p_key_prompt.add_argument("--region", default="")
+    p_key_prompt.add_argument("--no-activate", action="store_true")
+
+    p_key_runner = sub.add_parser("add-key-runner", help="Internal interactive API key prompt")
+    p_key_runner.add_argument("--provider", required=True)
+    p_key_runner.add_argument("--label", default="")
+    p_key_runner.add_argument("--region", default="")
+    p_key_runner.add_argument("--no-activate", action="store_true")
+
     p_login = sub.add_parser("launch-login", help="Open terminal to add a new account via native CLI login")
     p_login.add_argument("--provider", required=True)
     p_login.add_argument("--label", default="")
@@ -1779,6 +2028,14 @@ def main(argv: list[str]) -> int:
     try:
         if args.command == "login-runner":
             return run_login_interactive(args.provider, args.label)
+
+        if args.command == "add-key-runner":
+            return run_add_key_interactive(
+                args.provider,
+                args.label,
+                args.region,
+                activate=not args.no_activate,
+            )
 
         if args.command == "list":
             result = list_provider_accounts(args.provider) if args.provider else list_all_accounts()
@@ -1820,6 +2077,16 @@ def main(argv: list[str]) -> int:
             print(json.dumps(res, ensure_ascii=False))
             return 0
 
+        if args.command == "add-key-prompt":
+            res = prompt_add_api_key(
+                args.provider,
+                args.label,
+                region=args.region,
+                activate=not args.no_activate,
+            )
+            print(json.dumps(res, ensure_ascii=False))
+            return 0 if res.get("ok") else 1
+
         if args.command == "launch-login":
             res = launch_login_terminal(args.provider, args.label)
             print(json.dumps(res, ensure_ascii=False))
@@ -1838,7 +2105,9 @@ def main(argv: list[str]) -> int:
             return 0
 
     except Exception as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        msg = re.sub(r"(?i)(bearer\s+)[^\s\"',;]+", r"\1[REDACTED]", str(exc))
+        msg = re.sub(r"\b(?:sk-[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{4,}|dca:[A-Za-z0-9._~+/=-]{8,})\b", "[REDACTED]", msg)
+        print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False))
         return 1
 
     return 0

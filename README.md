@@ -66,12 +66,12 @@ Requirements: **KDE Plasma 6**, Python 3 (stdlib only), `secret-tool` (`libsecre
 
 ### Option 1: Prebuilt `.plasmoid` (GitHub Releases)
 
-Download `oasis-1.3.0.plasmoid` from [GitHub Releases](https://github.com/dralkh/oasis/releases/latest) and run:
+Download `oasis-1.4.0.plasmoid` from [GitHub Releases](https://github.com/dralkh/oasis/releases/latest) and run:
 
 ```sh
-kpackagetool6 -t Plasma/Applet -i oasis-1.3.0.plasmoid
+kpackagetool6 -t Plasma/Applet -i oasis-1.4.0.plasmoid
 # or upgrade an existing install:
-kpackagetool6 -t Plasma/Applet -u oasis-1.3.0.plasmoid
+kpackagetool6 -t Plasma/Applet -u oasis-1.4.0.plasmoid
 ```
 
 ### Option 2: From Source (includes Application Launcher entry)
@@ -179,6 +179,99 @@ Kimi Code, Grok**), updating each CLI's active credential store directly:
 * **Safe token sync:** Before switching away from an active account, Oasis
   syncs the live credential back to its vault snapshot so CLI-rotated refresh
   tokens are never lost.
+
+## Integrated local inference proxy (`⚡ Proxy`)
+
+Oasis supports two independent operating modes:
+
+* **Direct CLI mode (default, daemon-free):** Identical to v1.3.0 — zero
+  resident processes, native CLI credential switching and quota monitoring.
+* **Oasis Proxy mode (opt-in, bundled):** Ships with an integrated native
+  local inference proxy engine (`contents/bin/oasis-proxy`, built automatically
+  by `./install.sh`, `./build-plasmoid.sh`, AUR `PKGBUILD`, and GitHub Releases;
+  ~11 MiB idle RSS) that loads automatically when you switch to **Oasis Proxy**
+  or click **Start**. Binds strictly to `127.0.0.1:8317` with separate
+  generated 256-bit client and management keys, `UMask=0077`,
+  `proxy-url: "direct"`, and optional `systemd --user` lifecycle
+  (`oasis-proxy.service`) independent from Plasma.
+
+> **Credential ownership:** Rotating OAuth credentials (`codex`, `claude`,
+> `grok`, `kimi` OAuth) are strictly isolated in `~/.config/oasis/proxy/auths/`
+> (`0700`/`0600`) and are **never** copied or symlinked from your native CLI
+> directories so refresh tokens never collide. Direct CLI switching updates
+> native CLI files for new sessions; Oasis Proxy routes sessions through
+> `http://127.0.0.1:8317` with prompt-cache-preserving session affinity and
+> explicit per-provider account pinning.
+
+### Controlling Oasis Proxy from the CLI
+
+```sh
+# Inspect status (metadata only, never prints keys)
+python3 package/contents/code/oasis_proxy.py status --pretty
+
+# Start / stop / restart explicitly (loads the bundled Oasis Proxy engine automatically)
+python3 package/contents/code/oasis_proxy.py start
+python3 package/contents/code/oasis_proxy.py stop --direct
+
+# Set per-provider default model & thinking/reasoning mode
+python3 package/contents/code/oasis_proxy.py set-provider-default --provider=claude --model=claude-sonnet-5-5 --thinking=high
+
+# Configure single-daemon Tier Routing (Diamond / Gold / Silver / Subagent)
+python3 package/contents/code/oasis_proxy.py set-tier --tier=diamond --model=claude-opus-4-6 --thinking=high
+
+# Preview or apply cached AI Intel rankings directly into Tier Routing
+python3 package/contents/code/oasis_proxy.py import-intel
+python3 package/contents/code/oasis_proxy.py import-intel --apply
+```
+
+### Tier Routing & Per-Provider Thinking Modes
+
+A single `oasis-proxy` instance (~11 MiB RAM, shared OAuth pool and quotas) exposes both:
+* **Virtual model IDs** on `http://127.0.0.1:8317/v1`: `oasis/diamond`, `oasis/gold`, `oasis/silver`, `oasis/subagent`, and `oasis/<provider>`
+* **Dedicated tier base URLs** for clients that expect a separate endpoint per tier: `http://127.0.0.1:8317/tier/{diamond,gold,silver,subagent}/v1` (OpenAI) and `http://127.0.0.1:8317/tier/{tier}` (Anthropic / Gemini)
+
+Configured thinking/reasoning effort (`auto`, `none`, `low`, `medium`, `high`, `xhigh`, `max`) is translated natively into Anthropic `thinking`/`output_config`, OpenAI Responses `reasoning.effort`, OpenAI Chat `reasoning_effort`, and Gemini `thinkingConfig` whenever the client does not pass an explicit override.
+
+### Connecting coding agents & SDKs to Oasis Proxy
+
+Click **Copy URL** and **Copy Key** in the `⚡ Proxy` view (keys copy directly
+via `wl-copy`/`xclip`/`xsel` stdin and never appear in UI properties or logs),
+or run `python3 package/contents/code/oasis_proxy.py client-configs`:
+
+* **Claude Code:**
+  ```sh
+  export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
+  export ANTHROPIC_AUTH_TOKEN="<paste Oasis proxy client key>"
+  claude
+  ```
+* **OpenAI Codex (`~/.codex/config.toml`):**
+  ```toml
+  model_provider = "oasis"
+
+  [model_providers.oasis]
+  name = "Oasis Proxy"
+  base_url = "http://127.0.0.1:8317/v1"
+  wire_api = "responses"
+  env_key = "OASIS_PROXY_KEY"
+  ```
+* **OpenCode & Hermes Agent:**
+  ```sh
+  export OPENAI_BASE_URL=http://127.0.0.1:8317/v1
+  export OPENAI_API_KEY="<paste Oasis proxy client key>"
+  export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
+  export ANTHROPIC_API_KEY="<paste Oasis proxy client key>"
+  ```
+* **OpenAI Python SDK:**
+  ```python
+  from openai import OpenAI
+  client = OpenAI(base_url="http://127.0.0.1:8317/v1", api_key="<paste Oasis proxy client key>")
+  ```
+
+See the full architecture, security, provider protocol, and benchmark docs:
+- [ADR-0001: Proxy Backend Architecture & Dependency Audit](docs/ADR-0001-proxy-backend.md)
+- [Credential Ownership, Concurrency & Threat Model](docs/SECURITY_AND_CREDENTIALS.md)
+- [Provider Compatibility & Protocol Matrix](docs/PROVIDER_MATRIX.md)
+- [Performance Benchmarks (v1.3.0 vs. Integrated)](docs/BENCHMARKS.md)
 
 ## Limit notifications
 
@@ -301,6 +394,10 @@ Expected hosts: `chatgpt.com`, `api.anthropic.com`,
 * Plasma caches a panel item's size hint. The vertical layout therefore uses a
   fixed number of slots (default 4) rather than growing after the first fetch.
   Set **Vertical panel slots** to 6 when Muse/Kimi are also signed in.
+
+## Acknowledgments
+
+- **[`IuCC123/CLIProxyAPI-Rust`](https://github.com/IuCC123/CLIProxyAPI-Rust)** *(Unlicense)* — powers Oasis's optional local CLI inference proxy mode behind a replaceable backend adapter.
 
 ## License
 

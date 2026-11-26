@@ -22,14 +22,13 @@ ColumnLayout {
     signal switchAccountRequested(string providerId, string accountId)
     signal snapshotAccountRequested(string providerId, string label)
     signal launchLoginRequested(string providerId, string label)
-    signal addApiKeyRequested(string providerId, string label, string apiKey, string region)
+    signal addApiKeyPromptRequested(string providerId, string label, string region)
     signal renameAccountRequested(string providerId, string accountId, string newLabel)
     signal removeAccountRequested(string providerId, string accountId)
 
     property string editingAccountId: ""
     property string confirmRemoveId: ""
     property string selectedRegion: ""
-    property bool showKeyPlain: false
 
     readonly property color mutedColor: Qt.rgba(Kirigami.Theme.textColor.r,
                                                 Kirigami.Theme.textColor.g,
@@ -70,8 +69,6 @@ ColumnLayout {
         editingAccountId = ""
         confirmRemoveId = ""
         labelInput.text = ""
-        keyInput.text = ""
-        showKeyPlain = false
         var regions = currentCaps && currentCaps.regions ? currentCaps.regions : []
         selectedRegion = regions.length > 0 ? String(regions[0]) : ""
     }
@@ -704,34 +701,12 @@ ColumnLayout {
                         spacing: 5
 
                         Text {
-                            text: "Or add API key directly"
+                            text: "Or add API key securely (never passed via shell argv)"
                             color: modal.mutedColor
                             font.pixelSize: 9
                             font.bold: true
-                        }
-
-                        RowLayout {
+                            wrapMode: Text.WordWrap
                             Layout.fillWidth: true
-                            spacing: 4
-
-                            QQC2.TextField {
-                                id: keyInput
-                                Layout.fillWidth: true
-                                implicitHeight: 26
-                                font.pixelSize: 10
-                                echoMode: modal.showKeyPlain ? TextInput.Normal : TextInput.Password
-                                placeholderText: modal.currentCaps.api_key_placeholder || "Paste API key…"
-                            }
-
-                            QQC2.ToolButton {
-                                icon.name: modal.showKeyPlain ? "password-show-off" : "password-show-on"
-                                implicitWidth: 24
-                                implicitHeight: 24
-                                onClicked: modal.showKeyPlain = !modal.showKeyPlain
-                                QQC2.ToolTip.text: modal.showKeyPlain ? "Hide key" : "Show key"
-                                QQC2.ToolTip.visible: hovered
-                                QQC2.ToolTip.delay: 400
-                            }
                         }
 
                         RowLayout {
@@ -761,7 +736,7 @@ ColumnLayout {
                                             id: regTxt
                                             anchors.centerIn: parent
                                             text: modelData
-                                            color: activeReg ? Kirigami.Theme.highlightColor : modal.mutedColor
+                                            color: activeReg ? Kirigami.Theme.textColor : modal.mutedColor
                                             font.pixelSize: 9
                                             font.bold: activeReg
                                         }
@@ -774,19 +749,17 @@ ColumnLayout {
                             Item { Layout.fillWidth: true }
 
                             QQC2.Button {
-                                enabled: !modal.busy && keyInput.text.trim().length > 0
-                                implicitHeight: 24
-                                text: "Add & Switch"
+                                enabled: !modal.busy
+                                text: "Enter API Key…"
                                 font.pixelSize: 10
+                                Accessible.name: "Enter API key securely via password dialog"
                                 onClicked: {
-                                    if (modal.currentProvider && keyInput.text.trim().length > 0) {
-                                        modal.addApiKeyRequested(
+                                    if (modal.currentProvider) {
+                                        modal.addApiKeyPromptRequested(
                                             modal.currentProvider.id,
                                             labelInput.text.trim(),
-                                            keyInput.text.trim(),
                                             modal.selectedRegion
                                         )
-                                        keyInput.text = ""
                                         labelInput.text = ""
                                     }
                                 }

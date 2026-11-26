@@ -15,6 +15,9 @@ Kirigami.FormLayout {
     property alias cfg_warnThreshold: warn.value
     property alias cfg_criticalThreshold: critical.value
     property alias cfg_helperPath: helperPath.text
+    property alias cfg_proxyPort: proxyPort.value
+    property alias cfg_proxyBinaryPath: proxyBinaryPath.text
+    property alias cfg_showProxyStats: showProxyStats.checked
 
     QQC2.SpinBox {
         id: refresh
@@ -107,6 +110,41 @@ Kirigami.FormLayout {
         Layout.fillWidth: true
         Layout.maximumWidth: Kirigami.Units.gridUnit * 26
         text: "Leave blank to use the helper shipped inside the widget. The helper only reads local sign-in files and calls each provider's first-party usage endpoint."
+        wrapMode: Text.WordWrap
+        font: Kirigami.Theme.smallFont
+        opacity: 0.7
+    }
+
+    Item {
+        Kirigami.FormData.isSection: true
+    }
+
+    QQC2.SpinBox {
+        id: proxyPort
+        from: 1024
+        to: 65535
+        editable: true
+        textFromValue: function(value, locale) { return String(value) }
+        valueFromText: function(text, locale) { return parseInt(text, 10) || 8317 }
+        Kirigami.FormData.label: "Oasis Proxy port (127.0.0.1):"
+    }
+
+    QQC2.TextField {
+        id: proxyBinaryPath
+        Layout.fillWidth: true
+        placeholderText: "bundled Oasis Proxy"
+        Kirigami.FormData.label: "Custom proxy engine path:"
+    }
+
+    QQC2.CheckBox {
+        id: showProxyStats
+        text: "Show request statistics in Oasis Proxy view"
+    }
+
+    QQC2.Label {
+        Layout.fillWidth: true
+        Layout.maximumWidth: Kirigami.Units.gridUnit * 26
+        text: "Oasis stays in daemon-free Direct CLI mode by default. Leave custom engine path blank to use the integrated Oasis Proxy bundled with the widget."
         wrapMode: Text.WordWrap
         font: Kirigami.Theme.smallFont
         opacity: 0.7

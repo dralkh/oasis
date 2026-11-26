@@ -32,6 +32,11 @@ allowlist; `_check_host()` refuses anything else before a socket is opened.
 | `~/.claude/.credentials.json` | updated `claudeAiOauth` token fields on ~8h expiry (or on explicit user account switch, preserving `mcpOAuth`), under Claude Code's `.oauth_refresh.lock` + `.claude.lock` | `0600` |
 | `~/.config/oasis/accounts/index.json` | multi-account metadata only (ids, labels, emails, fingerprints; **no secrets**) | `0600` |
 | `~/.config/oasis/accounts/secrets/<provider>/<id>.json` | user-saved credential snapshots used by `oasis_accounts.py` for live CLI switching (inside `0700` dirs) | `0600` |
+| `~/.config/oasis/proxy/{state.json,config.yaml,policy.json,runtime.json}` | optional proxy control-plane config & generated 256-bit localhost client/management keys (written only when Proxy mode is initialized/started; inside `0700` dir, backend spawned under `umask 0077`) | `0600` |
+| `~/.config/oasis/proxy/auths/*.json` | strictly isolated proxy-owned OAuth credentials (never copied or symlinked from native CLI directories or `~/.config/oasis/accounts/`) | `0600` |
+| `~/.config/systemd/user/oasis-proxy.service` | optional systemd user unit (`UMask=0077`, `NoNewPrivileges=true`, `UnsetEnvironment=HTTP_PROXY ...`) created only when starting Proxy mode on systemd hosts | `0644` |
+
+See [`docs/SECURITY_AND_CREDENTIALS.md`](docs/SECURITY_AND_CREDENTIALS.md) for the complete Proxy mode credential ownership model and threat model (DNS rebinding, CSRF/CSWSH, SSRF, symlink/path traversal, secret redaction).
 
 Background polling (`ai_limits.py`) remains read-only for Codex, Grok, Cursor,
 Muse, Kimi, Qwen, and OpenCode credentials. Live CLI credential stores

@@ -24,6 +24,12 @@ PlasmoidItem {
     property string accountNotice: ""
     property string pendingAccountAction: ""
     property bool refreshQueued: false
+    property var proxyState: null
+    property var proxyIntelPreview: null
+    property bool proxyBusy: false
+    property string proxyError: ""
+    property string proxyNotice: ""
+    property string pendingProxyAction: ""
 
     readonly property var providers: payload && payload.providers ? payload.providers : []
 
@@ -67,6 +73,12 @@ PlasmoidItem {
         accountBusy: root.accountBusy
         accountError: root.accountError
         accountNotice: root.accountNotice
+        proxyState: root.proxyState
+        proxyIntelPreview: root.proxyIntelPreview
+        proxyBusy: root.proxyBusy
+        proxyError: root.proxyError
+        proxyNotice: root.proxyNotice
+        showProxyStats: Plasmoid.configuration.showProxyStats !== false
         onRefreshRequested: root.refresh()
         onQuitRequested: root.quit()
         onCloseRequested: root.expanded = false
@@ -75,13 +87,33 @@ PlasmoidItem {
         onSwitchAccountRequested: function(p, a) { root.switchAccount(p, a) }
         onSnapshotAccountRequested: function(p, l) { root.snapshotAccount(p, l) }
         onLaunchLoginRequested: function(p, l) { root.launchAccountLogin(p, l) }
-        onAddApiKeyRequested: function(p, l, k, r) { root.addApiKeyAccount(p, l, k, r) }
+        onAddApiKeyPromptRequested: function(p, l, r) { root.promptAddApiKeyAccount(p, l, r) }
         onRenameAccountRequested: function(p, a, l) { root.renameAccount(p, a, l) }
         onRemoveAccountRequested: function(p, a) { root.removeAccount(p, a) }
         onClearAccountMessagesRequested: {
             root.accountError = ""
             root.accountNotice = ""
         }
+        onProxyStatusRequested: root.refreshProxyStatus(false)
+        onProxyModeRequested: function(m) { root.setProxyMode(m) }
+        onProxyStartRequested: root.startProxy()
+        onProxyStopRequested: root.stopProxy()
+        onProxyRestartRequested: root.restartProxy()
+        onProxyCopyEndpointRequested: root.copyProxyEndpoint()
+        onProxyCopyClientKeyRequested: root.copyProxyClientKey()
+        onProxyRotateKeyRequested: root.rotateProxyKey()
+        onProxyRoutingChanged: function(p) { root.updateProxyRouting(p) }
+        onProxyPinAccountRequested: function(p, a) { root.pinProxyAccount(p, a) }
+        onProxyUnpinAccountRequested: function(p) { root.unpinProxyAccount(p) }
+        onProxyToggleAccountRequested: function(a, d) { root.toggleProxyAccount(a, d) }
+        onProxyResetCooldownRequested: function(a) { root.resetProxyCooldown(a) }
+        onProxyLaunchLoginRequested: function(p) { root.launchProxyLogin(p) }
+        onProxyProviderDefaultRequested: function(p, m, t) { root.setProxyProviderDefault(p, m, t) }
+        onProxySetTierRequested: function(t, m, th, c) { root.setProxyTier(t, m, th, c) }
+        onProxyCopyTierEndpointRequested: function(t) { root.copyProxyTierEndpoint(t) }
+        onProxyImportIntelPreviewRequested: root.previewProxyIntelImport()
+        onProxyImportIntelApplyRequested: root.applyProxyIntelImport()
+        onProxyClearIntelPreviewRequested: root.proxyIntelPreview = null
     }
 
     Plasma5Support.DataSource {
@@ -210,6 +242,10 @@ PlasmoidItem {
             try {
                 var doc = JSON.parse(output)
                 if (!doc || doc.ok === false) {
+                    if (doc && doc.canceled) {
+                        root.accountError = ""
+                        return
+                    }
                     root.accountError = doc && doc.error ? String(doc.error) : "account action failed"
                     return
                 }
@@ -221,9 +257,15 @@ PlasmoidItem {
                     root.clearLimitStateForProvider(doc.provider)
                     root.refresh()
                 } else if (action === "add-key") {
-                    root.accountNotice = "Added & activated " + pName + " → " + lbl
-                    root.clearLimitStateForProvider(doc.provider)
-                    root.refresh()
+                    if (doc.launched) {
+                        root.accountNotice = doc.message
+                            ? String(doc.message) + " Refresh once finished."
+                            : "Opened terminal to enter API key. Refresh once finished."
+                    } else {
+                        root.accountNotice = "Added & activated " + pName + " → " + lbl
+                        root.clearLimitStateForProvider(doc.provider)
+                        root.refresh()
+                    }
                 } else if (action === "snapshot") {
                     root.accountNotice = "Saved " + pName + " account: " + lbl
                     root.refresh()
@@ -248,7 +290,7 @@ PlasmoidItem {
     }
 
     Timer {
-        interval: 20000
+        interval: root.pendingAccountAction === "add-key" ? 120000 : 20000
         running: root.accountBusy
         onTriggered: {
             accountSource.connectedSources = []
@@ -263,6 +305,115 @@ PlasmoidItem {
         interval: 5500
         repeat: false
         onTriggered: root.accountNotice = ""
+    }
+
+    // Optional local inference proxy control plane (isolated from quota polling).
+    Plasma5Support.DataSource {
+        id: proxySource
+        engine: "executable"
+        onNewData: function(sourceName, data) {
+            if (proxySource.connectedSources.indexOf(sourceName) === -1) {
+                return
+            }
+            proxySource.disconnectSource(sourceName)
+            var action = root.pendingProxyAction
+            root.pendingProxyAction = ""
+            root.proxyBusy = false
+
+            var output = (data.stdout || "").trim()
+            var detail = (data.stderr || "").trim()
+            if (output.length === 0) {
+                root.proxyError = detail.length > 0 ? detail : "proxy helper returned no data"
+                return
+            }
+            try {
+                var doc = JSON.parse(output)
+                if (!doc || doc.ok === false) {
+                    root.proxyError = doc && doc.error ? String(doc.error) : "proxy action failed"
+                    return
+                }
+                root.proxyError = ""
+                if (action === "status") {
+                    root.proxyState = doc
+                    return
+                }
+                if (action === "import-intel-preview") {
+                    root.proxyIntelPreview = doc
+                    return
+                }
+                if (action === "copy-endpoint") {
+                    root.proxyNotice = "Copied Oasis Proxy endpoint (" + String(doc.endpoint || "127.0.0.1") + ")"
+                } else if (action === "copy-tier-endpoint") {
+                    root.proxyNotice = "Copied " + String(doc.tier || "") + " tier URL (" + String(doc.endpoint || "127.0.0.1") + ")"
+                } else if (action === "copy-client-key") {
+                    root.proxyNotice = "Copied Oasis Proxy client API key to clipboard"
+                } else if (action === "rotate-key") {
+                    root.proxyNotice = "Rotated client API key (update connected clients)"
+                } else if (action === "start") {
+                    root.proxyNotice = "Oasis Proxy started on " + String(doc.endpoint || "127.0.0.1")
+                } else if (action === "stop") {
+                    root.proxyNotice = "Oasis Proxy stopped"
+                } else if (action === "restart") {
+                    root.proxyNotice = "Oasis Proxy restarted"
+                } else if (action === "mode") {
+                    root.proxyNotice = doc.mode === "direct"
+                        ? "Switched to Direct CLI mode (daemon-free)"
+                        : "Switched to Oasis Proxy mode"
+                } else if (action === "pin") {
+                    root.proxyNotice = "Pinned " + String(doc.label || "account") + " for " + F.meta(doc.provider).name
+                } else if (action === "unpin") {
+                    root.proxyNotice = "Cleared account pin for " + F.meta(doc.provider).name
+                } else if (action === "toggle") {
+                    root.proxyNotice = doc.disabled ? "Disabled proxy account" : "Enabled proxy account"
+                } else if (action === "reset") {
+                    root.proxyNotice = "Cleared account cooldown"
+                } else if (action === "launch-login") {
+                    root.proxyNotice = doc.message ? String(doc.message) : "Opened isolated Oasis Proxy sign-in terminal"
+                } else if (action === "routing") {
+                    root.proxyNotice = "Updated Oasis Proxy routing settings"
+                } else if (action === "provider-default") {
+                    root.proxyNotice = "Updated " + F.meta(doc.provider).name
+                        + (doc.model ? (" → " + String(doc.model)) : "")
+                        + " (thinking: " + String(doc.thinking || "auto") + ")"
+                } else if (action === "set-tier") {
+                    root.proxyNotice = doc.cleared
+                        ? ("Cleared " + String(doc.tier || "") + " tier")
+                        : ("Saved " + String(doc.tier || "") + " tier")
+                } else if (action === "import-intel-apply") {
+                    root.proxyIntelPreview = null
+                    root.proxyNotice = "Imported AI Intel tiers into Oasis Proxy"
+                }
+                if (doc.warning && String(doc.warning).length > 0) {
+                    root.proxyNotice = root.proxyNotice.length > 0
+                        ? root.proxyNotice + " (" + String(doc.warning) + ")"
+                        : String(doc.warning)
+                }
+                proxyNoticeTimer.restart()
+                if (action !== "copy-endpoint" && action !== "copy-tier-endpoint" && action !== "copy-client-key" && action !== "launch-login") {
+                    root.refreshProxyStatus(true)
+                }
+            } catch (error) {
+                root.proxyError = detail.length > 0 ? detail : "invalid proxy helper output"
+            }
+        }
+    }
+
+    Timer {
+        interval: 55000
+        running: root.proxyBusy
+        onTriggered: {
+            proxySource.connectedSources = []
+            root.proxyBusy = false
+            root.pendingProxyAction = ""
+            root.proxyError = "proxy action timed out"
+        }
+    }
+
+    Timer {
+        id: proxyNoticeTimer
+        interval: 5500
+        repeat: false
+        onTriggered: root.proxyNotice = ""
     }
 
     Timer {
@@ -335,6 +486,150 @@ PlasmoidItem {
         return localFilePath(Qt.resolvedUrl("../code/oasis_accounts.py"))
     }
 
+    function proxyPath() {
+        return localFilePath(Qt.resolvedUrl("../code/oasis_proxy.py"))
+    }
+
+    function runProxyCommand(action, commandLine, preserveNotice) {
+        if (root.proxyBusy) {
+            return
+        }
+        root.proxyBusy = true
+        root.proxyError = ""
+        if (!preserveNotice) {
+            root.proxyNotice = ""
+        }
+        root.pendingProxyAction = action
+        proxySource.connectedSources = []
+        proxySource.connectSource(commandLine)
+    }
+
+    function proxyEndpointArgs() {
+        var args = ""
+        var port = Number(Plasmoid.configuration.proxyPort || 8317)
+        if (port >= 1024 && port <= 65535) {
+            args += " --port=" + String(Math.round(port))
+        }
+        var bin = String(Plasmoid.configuration.proxyBinaryPath || "").trim()
+        if (bin.length > 0) {
+            args += " --binary=" + shellQuote(bin)
+        }
+        return args
+    }
+
+    function refreshProxyStatus(preserveNotice) {
+        var cmd = "python3 " + shellQuote(root.proxyPath()) + " status" + proxyEndpointArgs()
+        if (Plasmoid.configuration.showProxyStats === false) {
+            cmd += " --no-requests"
+        }
+        runProxyCommand("status", cmd, !!preserveNotice)
+    }
+
+    function setProxyMode(mode) {
+        if (mode === "proxy") {
+            startProxy()
+            return
+        }
+        runProxyCommand("mode", "python3 " + shellQuote(root.proxyPath()) + " set-mode " + shellQuote(mode), false)
+    }
+
+    function startProxy() {
+        var cmd = "python3 " + shellQuote(root.proxyPath()) + " start" + proxyEndpointArgs()
+        runProxyCommand("start", cmd, false)
+    }
+
+    function stopProxy() {
+        runProxyCommand("stop", "python3 " + shellQuote(root.proxyPath()) + " stop --direct", false)
+    }
+
+    function restartProxy() {
+        var cmd = "python3 " + shellQuote(root.proxyPath()) + " restart" + proxyEndpointArgs()
+        runProxyCommand("restart", cmd, false)
+    }
+
+    function copyProxyEndpoint() {
+        runProxyCommand("copy-endpoint", "python3 " + shellQuote(root.proxyPath()) + " copy-endpoint", false)
+    }
+
+    function copyProxyClientKey() {
+        runProxyCommand("copy-client-key", "python3 " + shellQuote(root.proxyPath()) + " copy-client-key", false)
+    }
+
+    function rotateProxyKey() {
+        runProxyCommand("rotate-key", "python3 " + shellQuote(root.proxyPath()) + " rotate-key", false)
+    }
+
+    function updateProxyRouting(patch) {
+        if (!patch) return
+        var cmd = "python3 " + shellQuote(root.proxyPath()) + " set-routing"
+        if (patch.strategy !== undefined) cmd += " --strategy=" + shellQuote(patch.strategy)
+        if (patch.session_affinity !== undefined) cmd += " --session-affinity=" + (patch.session_affinity ? "true" : "false")
+        if (patch.codex_websockets !== undefined) cmd += " --codex-websockets=" + (patch.codex_websockets ? "true" : "false")
+        if (patch.force_model_prefix !== undefined) cmd += " --force-model-prefix=" + (patch.force_model_prefix ? "true" : "false")
+        if (patch.allow_metered_fallback !== undefined) cmd += " --allow-metered-fallback=" + (patch.allow_metered_fallback ? "true" : "false")
+        if (patch.provider !== undefined) cmd += " --provider=" + shellQuote(patch.provider)
+        if (patch.model !== undefined) cmd += " --model=" + shellQuote(patch.model)
+        runProxyCommand("routing", cmd, false)
+    }
+
+    function pinProxyAccount(providerId, accountId) {
+        runProxyCommand(
+            "pin",
+            "python3 " + shellQuote(root.proxyPath()) + " pin-account --provider=" + shellQuote(providerId) + " --account=" + shellQuote(accountId),
+            false)
+    }
+
+    function unpinProxyAccount(providerId) {
+        runProxyCommand("unpin", "python3 " + shellQuote(root.proxyPath()) + " unpin-account --provider=" + shellQuote(providerId), false)
+    }
+
+    function toggleProxyAccount(accountId, disabled) {
+        runProxyCommand(
+            "toggle",
+            "python3 " + shellQuote(root.proxyPath()) + " toggle-account --account=" + shellQuote(accountId) + " --disabled=" + (disabled ? "true" : "false"),
+            false)
+    }
+
+    function resetProxyCooldown(accountId) {
+        runProxyCommand("reset", "python3 " + shellQuote(root.proxyPath()) + " reset-cooldown --account=" + shellQuote(accountId), false)
+    }
+
+    function launchProxyLogin(providerId) {
+        runProxyCommand("launch-login", "python3 " + shellQuote(root.proxyPath()) + " launch-login --provider=" + shellQuote(providerId), false)
+    }
+
+    function setProxyProviderDefault(providerId, model, thinking) {
+        var cmd = "python3 " + shellQuote(root.proxyPath())
+            + " set-provider-default --provider=" + shellQuote(providerId)
+            + " --model=" + shellQuote(model || "")
+            + " --thinking=" + shellQuote(thinking || "auto")
+        runProxyCommand("provider-default", cmd, false)
+    }
+
+    function setProxyTier(tier, model, thinking, clear) {
+        var cmd = "python3 " + shellQuote(root.proxyPath())
+            + " set-tier --tier=" + shellQuote(tier)
+        if (clear) {
+            cmd += " --clear"
+        } else {
+            cmd += " --model=" + shellQuote(model || "")
+                + " --thinking=" + shellQuote(thinking || "auto")
+        }
+        runProxyCommand("set-tier", cmd, false)
+    }
+
+    function copyProxyTierEndpoint(tier) {
+        runProxyCommand("copy-tier-endpoint", "python3 " + shellQuote(root.proxyPath()) + " copy-tier-endpoint --tier=" + shellQuote(tier), false)
+    }
+
+    function previewProxyIntelImport() {
+        runProxyCommand("import-intel-preview", "python3 " + shellQuote(root.proxyPath()) + " import-intel", false)
+    }
+
+    function applyProxyIntelImport() {
+        runProxyCommand("import-intel-apply", "python3 " + shellQuote(root.proxyPath()) + " import-intel --apply", false)
+    }
+
     function clearLimitStateForProvider(providerId) {
         if (!providerId) {
             return
@@ -387,16 +682,14 @@ PlasmoidItem {
         runAccountCommand("launch-login", cmd)
     }
 
-    function addApiKeyAccount(providerId, label, apiKey, region) {
-        var safePath = root.accountsPath().replace(/['\n\r]/g, "")
-        var b64 = Qt.btoa(unescape(encodeURIComponent(String(apiKey || ""))))
-        var cmd = "printf '%s' " + shellQuote(b64) + " | base64 -d | python3 '" + safePath
-            + "' add-key --provider " + shellQuote(providerId)
+    function promptAddApiKeyAccount(providerId, label, region) {
+        var cmd = "python3 " + shellQuote(root.accountsPath())
+            + " add-key-prompt --provider=" + shellQuote(providerId)
         if (label && label.length > 0) {
-            cmd += " --label " + shellQuote(label)
+            cmd += " --label=" + shellQuote(label)
         }
         if (region && region.length > 0) {
-            cmd += " --region " + shellQuote(region)
+            cmd += " --region=" + shellQuote(region)
         }
         runAccountCommand("add-key", cmd)
     }

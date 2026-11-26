@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 UA = f"ai-limits-kde/{VERSION}"
 
 HOME = Path.home()
@@ -852,7 +852,7 @@ def _claude_fetch_snapshot(oauth: dict[str, Any], account_id: str) -> Provider:
             updated["scopes"] = granted.split()
         mod = _load_accounts_module()
         if mod is not None:
-            mod.update_vault_claude_oauth(account_id, updated)
+            mod.update_vault_claude_oauth(account_id, updated, expected_refresh=refresh_token)
         merged = dict(oauth)
         merged.update(updated)
         return merged

@@ -1,18 +1,26 @@
 # Maintainer: dralk <https://github.com/dralkh>
 pkgname=plasma6-applets-oasis
-pkgver=1.3.0
+pkgver=1.4.0
 pkgrel=1
-pkgdesc="KDE Plasma 6 panel widget for AI coding CLI usage limits, live multi-account switching, reset credits, subscription countdowns & AI Intel (Codex, Claude Code, Antigravity, OpenCode Go, Qwen, Cursor, Kimi, Grok, Muse)"
-arch=('any')
+pkgdesc="KDE Plasma 6 panel widget for AI coding CLI usage limits, live multi-account switching, integrated Oasis Proxy, reset credits & AI Intel"
+arch=('x86_64' 'aarch64')
 url="https://github.com/dralkh/oasis"
 license=('MIT')
 depends=('plasma-workspace' 'python')
+makedepends=('cargo')
 optdepends=(
     'libsecret: Secret Service keyring lookup for Antigravity, Cursor, and Muse Code'
     'libnotify: desktop notifications when a usage window reaches 100%'
+    'wl-clipboard: clipboard copy for Oasis Proxy endpoint and client API key on Wayland'
+    'xclip: clipboard copy for Oasis Proxy endpoint and client API key on X11'
 )
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/dralkh/oasis/archive/refs/tags/v${pkgver}.tar.gz")
 sha256sums=('SKIP')
+
+build() {
+    cd "oasis-${pkgver}"
+    cargo build --release --locked --manifest-path proxy/Cargo.toml --bin oasis-proxy
+}
 
 package() {
     cd "oasis-${pkgver}"
@@ -23,7 +31,10 @@ package() {
     chmod 755 "${dest}/contents/code/ai_limits.py" \
               "${dest}/contents/code/oasisctl.py" \
               "${dest}/contents/code/oasis_intel.py" \
-              "${dest}/contents/code/oasis_accounts.py"
+              "${dest}/contents/code/oasis_accounts.py" \
+              "${dest}/contents/code/oasis_proxy.py"
+
+    install -Dm755 proxy/target/release/oasis-proxy "${dest}/contents/bin/oasis-proxy"
 
     install -Dm644 package/contents/icons/ai-limits.svg \
         "${pkgdir}/usr/share/icons/hicolor/scalable/apps/org.dralk.ailimits.svg"

@@ -14,14 +14,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate Python helpers
-        run: |
-          python3 -m py_compile package/contents/code/ai_limits.py package/contents/code/oasis_accounts.py package/contents/code/oasisctl.py package/contents/code/oasis_intel.py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      - name: Build .plasmoid archive
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify tag matches metadata.json version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          META_VER=$(python3 -c 'import json; print("v" + json.load(open("package/metadata.json"))["KPlugin"]["Version"])')
+          if [ "$TAG" != "$META_VER" ]; then
+            echo "Tag $TAG does not match package/metadata.json version $META_VER" >&2
+            exit 1
+          fi
+
+      - name: Build integrated Oasis Proxy engine
+        run: |
+          cargo build --release --locked --manifest-path proxy/Cargo.toml --bin oasis-proxy
+          mkdir -p package/contents/bin
+          cp -f proxy/target/release/oasis-proxy package/contents/bin/oasis-proxy
+          chmod 0755 package/contents/bin/oasis-proxy
+
+      - name: Validate Python helpers, lint & run full test suite (with integrated Oasis Proxy)
+        run: |
+          python3 -m py_compile \
+            package/contents/code/ai_limits.py \
+            package/contents/code/oasis_accounts.py \
+            package/contents/code/oasis_proxy.py \
+            package/contents/code/oasisctl.py \
+            package/contents/code/oasis_intel.py
+          sh -n install.sh uninstall.sh build-plasmoid.sh
+          python3 -m pip install --no-cache-dir pytest ruff
+          ruff check package/contents/code/ tests/
+          pytest -v tests/
+
+      - name: Build reproducible .plasmoid archive (with integrated Oasis Proxy)
         run: |
           chmod +x build-plasmoid.sh
           ./build-plasmoid.sh
+          (cd dist && sha256sum -c SHA256SUMS.txt)
 
       - name: Upload assets to GitHub Release
         env:
