@@ -18,6 +18,7 @@ Item {
     property bool intelBusy: false
     property string intelError: ""
     property bool intelOpen: false
+    property string intelAgent: "auto"
     property bool accountBusy: false
     property string accountError: ""
     property string accountNotice: ""
@@ -35,7 +36,8 @@ Item {
     signal quitRequested()
     signal closeRequested()
     signal intelLoadRequested()
-    signal intelScanRequested()
+    signal intelScanRequested(string agentId)
+    signal intelAgentSelected(string agentId)
     signal switchAccountRequested(string providerId, string accountId)
     signal snapshotAccountRequested(string providerId, string label)
     signal launchLoginRequested(string providerId, string label)
@@ -186,8 +188,10 @@ Item {
         nowMs: full.nowMs
         scanning: full.intelBusy
         errorText: full.intelError
+        selectedAgent: full.intelAgent
         onBackRequested: full.intelOpen = false
-        onScanRequested: full.intelScanRequested()
+        onScanRequested: function(a) { full.intelScanRequested(a) }
+        onAgentSelected: function(a) { full.intelAgentSelected(a) }
         onQuitRequested: full.quitRequested()
     }
 
@@ -373,7 +377,7 @@ Item {
                             : Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.08)
                 }
 
-                QQC2.ToolTip.text: "AI Intel modal (deals, model tiers, projections via pi + Tavily)"
+                QQC2.ToolTip.text: "AI Intel modal (deals, model tiers, projections via any installed CLI agent)"
                 QQC2.ToolTip.visible: hovered
                 QQC2.ToolTip.delay: 500
             }

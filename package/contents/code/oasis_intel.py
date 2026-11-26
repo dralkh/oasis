@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Oasis AI Intel helper: two-stage grounded web intelligence engine.
 
-Stage 1: Executes a parallel Tavily `advanced` search sweep across benchmarks,
-         measured cost-per-task leaderboards, regional/local deals, retention
-         offers, and policy changes across all Oasis-supported providers.
-Stage 2: Feeds the deduplicated, spam-filtered evidence dossier into `pi`
-         (using your configured default model + Tavily MCP for follow-up
-         extraction) to synthesize a compact, evidence-grounded JSON brief.
+Stage 1: Executes a parallel Tavily `advanced` search sweep (when TAVILY_API_KEY
+         is available) across benchmarks, measured cost-per-task leaderboards,
+         regional/local deals, retention offers, and policy changes across all
+         Oasis-supported providers.
+Stage 2: Feeds the deduplicated, spam-filtered evidence dossier into ANY
+         installed CLI agent (`claude`, `codex`, `opencode`, `gemini`, `pi`,
+         `qwen`, `kimi` — auto-selected or explicitly chosen by the user) to
+         synthesize a compact, evidence-grounded JSON brief.
 
 Subcommands:
-  read   Return the cached intel report enriched with live local limit projections.
-  scan   Run Stage 1 + Stage 2, cache at ~/.cache/ai-limits/intel.json (0600),
-         and print JSON.
+  read    Return the cached intel report enriched with live local limit
+          projections and detected CLI agents.
+  scan    Run Stage 1 + Stage 2 with the selected (or auto-detected) CLI agent,
+          cache at ~/.cache/ai-limits/intel.json (0600), and print JSON.
+  agents  List detected CLI agents available for AI Intel scans.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -38,6 +43,20 @@ USAGE_CACHE = CACHE_DIR / "last.json"
 INTEL_CACHE = CACHE_DIR / "intel.json"
 PI_SETTINGS = HOME / ".pi" / "agent" / "settings.json"
 MCP_CONFIG = HOME / ".config" / "mcp" / "mcp.json"
+
+# Ordered registry of supported CLI agents for AI Intel synthesis.
+# Each entry maps an Oasis agent ID to its executable name, display label, and
+# corresponding Oasis usage provider ID (used to prefer signed-in CLIs in Auto mode).
+INTEL_AGENTS: tuple[dict[str, str], ...] = (
+    {"id": "claude", "bin": "claude", "label": "Claude", "provider": "claude"},
+    {"id": "codex", "bin": "codex", "label": "Codex", "provider": "codex"},
+    {"id": "opencode", "bin": "opencode", "label": "OpenCode", "provider": "opencodego"},
+    {"id": "gemini", "bin": "gemini", "label": "Gemini", "provider": "antigravity"},
+    {"id": "pi", "bin": "pi", "label": "Pi", "provider": ""},
+    {"id": "qwen", "bin": "qwen", "label": "Qwen", "provider": "qwen"},
+    {"id": "kimi", "bin": "kimi", "label": "Kimi", "provider": "kimi"},
+)
+VALID_AGENT_IDS: tuple[str, ...] = ("auto",) + tuple(a["id"] for a in INTEL_AGENTS)
 
 PROVIDERS_TRACKED = [
     "Codex (OpenAI ChatGPT Plus / Pro / Go)",
@@ -249,8 +268,8 @@ def pi_default_model() -> str:
     return "pi default"
 
 
-def find_pi() -> tuple[Optional[str], dict[str, str]]:
-    """Locate `pi` even when plasmashell runs with a minimal PATH."""
+def enriched_env() -> dict[str, str]:
+    """Build an enriched PATH so CLI agents are found even under plasmashell's minimal PATH."""
     env = dict(os.environ)
     extra_dirs: list[str] = []
 
@@ -258,8 +277,10 @@ def find_pi() -> tuple[Optional[str], dict[str, str]]:
     extra_dirs.extend(nvm_bins)
     for cand in (
         HOME / ".local/bin",
+        HOME / ".opencode/bin",
         HOME / ".local/share/pnpm",
         HOME / ".npm-global/bin",
+        HOME / ".cargo/bin",
         Path("/usr/local/bin"),
         Path("/usr/bin"),
     ):
@@ -272,12 +293,214 @@ def find_pi() -> tuple[Optional[str], dict[str, str]]:
         if d not in parts:
             parts.append(d)
     env["PATH"] = os.pathsep.join(parts)
+    return env
 
-    pi_bin = shutil.which("pi", path=env["PATH"])
-    if pi_bin:
-        bin_dir = str(Path(pi_bin).resolve().parent)
-        env["PATH"] = bin_dir + os.pathsep + env["PATH"]
-    return pi_bin, env
+
+def find_cli(binary: str, env: Optional[dict[str, str]] = None) -> tuple[Optional[str], dict[str, str]]:
+    """Locate any supported CLI binary with an enriched PATH."""
+    run_env = dict(env) if env is not None else enriched_env()
+    found = shutil.which(binary, path=run_env.get("PATH", ""))
+    if found:
+        bin_dir = str(Path(found).resolve().parent)
+        run_env["PATH"] = bin_dir + os.pathsep + run_env.get("PATH", "")
+    return found, run_env
+
+
+def find_pi() -> tuple[Optional[str], dict[str, str]]:
+    """Locate `pi` even when plasmashell runs with a minimal PATH."""
+    return find_cli("pi")
+
+
+def _active_usage_providers(usage_doc: Any) -> set[str]:
+    out: set[str] = set()
+    providers = usage_doc.get("providers", []) if isinstance(usage_doc, dict) else []
+    for p in providers:
+        if isinstance(p, dict) and p.get("status") == "ok" and p.get("id"):
+            out.add(str(p["id"]).lower())
+    return out
+
+
+def discover_agents(usage_doc: Any = None) -> list[dict[str, Any]]:
+    """Discover all installed CLI agents available to run AI Intel scans."""
+    env = enriched_env()
+    active_provs = _active_usage_providers(usage_doc)
+    detected: list[dict[str, Any]] = []
+    for spec in INTEL_AGENTS:
+        bin_path = shutil.which(spec["bin"], path=env.get("PATH", ""))
+        detected.append({
+            "id": spec["id"],
+            "label": spec["label"],
+            "installed": bool(bin_path),
+            "binary": bin_path,
+            "signed_in": bool(spec["provider"] and spec["provider"] in active_provs),
+        })
+
+    # Choose best Auto target: prefer an installed CLI whose provider is currently signed in,
+    # otherwise the first installed CLI in priority order (including pi as fallback).
+    installed = [a for a in detected if a["installed"]]
+    auto_pick = next((a for a in installed if a["signed_in"]), None) or (installed[0] if installed else None)
+    auto_entry: dict[str, Any] = {
+        "id": "auto",
+        "label": "Auto",
+        "installed": auto_pick is not None,
+        "resolved": auto_pick["id"] if auto_pick else None,
+        "detail": f"Auto ({auto_pick['label']})" if auto_pick else "Auto (no CLI found)",
+    }
+    return [auto_entry] + detected
+
+
+def normalize_agent_id(agent: Optional[str]) -> str:
+    clean = str(agent or "auto").strip().lower()
+    if clean in VALID_AGENT_IDS:
+        return clean
+    return "auto"
+
+
+def resolve_agent(requested: str, agents: list[dict[str, Any]]) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Resolve `requested` ('auto' or specific agent ID) into an installed agent entry."""
+    clean = normalize_agent_id(requested)
+    by_id = {a["id"]: a for a in agents}
+    if clean == "auto":
+        auto_entry = by_id.get("auto") or {}
+        resolved_id = auto_entry.get("resolved")
+        if resolved_id and resolved_id in by_id and by_id[resolved_id].get("installed"):
+            return by_id[resolved_id], None
+        return None, "No supported CLI agent found (install claude, codex, opencode, gemini, pi, qwen, or kimi)."
+    entry = by_id.get(clean)
+    if not entry or not entry.get("installed"):
+        label = entry["label"] if entry else clean
+        return None, f"{label} CLI (`{clean}`) not found in PATH."
+    return entry, None
+
+
+def agent_model_label(agent_id: str) -> str:
+    if agent_id == "pi":
+        pm = pi_default_model()
+        return f"pi ({pm})" if pm != "pi default" else "pi"
+    for spec in INTEL_AGENTS:
+        if spec["id"] == agent_id:
+            return f"{spec['label']} CLI"
+    return agent_id
+
+
+def run_agent_prompt(
+    agent: dict[str, Any],
+    prompt: str,
+    timeout: int,
+) -> tuple[Optional[str], Optional[str]]:
+    """Execute `prompt` non-interactively using the selected CLI agent.
+
+    Returns (raw_text_output, error_message). Always runs ephemerally with zero
+    interactive prompts and no workspace mutation.
+    """
+    agent_id = str(agent["id"])
+    bin_path = str(agent["binary"])
+    env = enriched_env()
+    bin_dir = str(Path(bin_path).resolve().parent)
+    env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+
+    tmp_out: Optional[Path] = None
+    stdin_data: Optional[str] = None
+    cmd: list[str]
+
+    if agent_id == "claude":
+        cmd = [
+            bin_path,
+            "--print",
+            "--no-session-persistence",
+            "--output-format",
+            "text",
+        ]
+        if MCP_CONFIG.is_file():
+            cmd += ["--mcp-config", str(MCP_CONFIG)]
+        stdin_data = prompt
+    elif agent_id == "codex":
+        fd, tmp_name = tempfile.mkstemp(prefix="oasis-intel-codex-", suffix=".txt")
+        os.close(fd)
+        tmp_out = Path(tmp_name)
+        cmd = [
+            bin_path,
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--color",
+            "never",
+            "-o",
+            str(tmp_out),
+            "-",
+        ]
+        stdin_data = prompt
+    elif agent_id == "opencode":
+        cmd = [bin_path, "run", "--format", "default", prompt]
+    elif agent_id == "gemini":
+        cmd = [
+            bin_path,
+            "--output-format",
+            "text",
+            "-p",
+            "Follow the Oasis AI Intel instructions provided on stdin and output ONLY a single valid JSON object.",
+        ]
+        stdin_data = prompt
+    elif agent_id == "qwen":
+        cmd = [
+            bin_path,
+            "-p",
+            "Follow the Oasis AI Intel instructions provided on stdin and output ONLY a single valid JSON object.",
+        ]
+        stdin_data = prompt
+    elif agent_id == "kimi":
+        cmd = [bin_path, "--print", "-p", prompt]
+    elif agent_id == "pi":
+        cmd = [
+            bin_path,
+            "--print",
+            "--no-session",
+            "--no-builtin-tools",
+            "--no-lens",
+            "--no-lsp",
+            "--mode",
+            "text",
+        ]
+        if MCP_CONFIG.is_file():
+            cmd += ["--mcp-config", str(MCP_CONFIG)]
+        cmd += ["--", prompt]
+    else:
+        return None, f"unsupported CLI agent: {agent_id}"
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=stdin_data,
+            env=env,
+            cwd=str(HOME),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        raw_out = proc.stdout or ""
+        if tmp_out is not None and tmp_out.is_file():
+            try:
+                file_txt = tmp_out.read_text(encoding="utf-8", errors="replace").strip()
+                if file_txt:
+                    raw_out = file_txt
+            except OSError:
+                pass
+        if not raw_out.strip() and proc.returncode != 0:
+            detail = (proc.stderr or "").strip().splitlines()
+            msg = detail[-1][:180] if detail else f"{agent_id} exited with code {proc.returncode}"
+            return None, f"{agent['label']} CLI failed ({msg})"
+        return raw_out, None
+    except subprocess.TimeoutExpired:
+        return None, f"{agent['label']} CLI intel scan timed out after {timeout}s."
+    except OSError as exc:
+        return None, f"failed to run {agent['label']} CLI: {exc}"
+    finally:
+        if tmp_out is not None:
+            try:
+                tmp_out.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -423,14 +646,14 @@ def build_prompt(
     dossier_block = (
         f"### PRE-FETCHED TAVILY ADVANCED EVIDENCE DOSSIER (gathered {today})\n{dossier}"
         if dossier
-        else "No pre-fetched dossier; run thorough `tavily_search` (`search_depth: \"advanced\"`) and `tavily_extract` calls across all tracks."
+        else "No pre-fetched Tavily dossier; use your available web search/fetch tools (if available) to verify current deals, pricing, and benchmark figures."
     )
 
     return f"""You are the Oasis AI Intel senior research analyst. Today is **{today} ({month_year})**.
 Scope: **WORLDWIDE (ALL COUNTRIES & REGIONS)** — do NOT bias toward or restrict to any single country.
 
-Below is a fresh multi-query Tavily `advanced` evidence dossier gathered right now.
-You ALSO have `tavily_search` and `tavily_extract` tools available — USE THEM (2–5 targeted follow-ups/extractions) whenever a high-value global/regional deal, country-specific pricing promo, or benchmark figure is truncated in a snippet.
+Below is a fresh multi-query evidence dossier gathered right now (if Tavily is configured).
+If you have web search or fetch tools available (`tavily_search`, `WebSearch`, `WebFetch`, etc.), run 2–5 targeted follow-ups whenever a high-value global/regional deal, country-specific pricing promo, or benchmark figure is missing or truncated.
 
 {dossier_block}
 
@@ -542,13 +765,20 @@ def merge_report(
     live_projections: list[dict[str, Any]],
     highlights: list[dict[str, str]],
     model_used: str,
+    *,
+    available_agents: Optional[list[dict[str, Any]]] = None,
+    selected_agent: str = "auto",
+    agent_used: Optional[str] = None,
     error: Optional[str] = None,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
-        "version": 4,
+        "version": 5,
         "has_scan": bool(raw and raw.get("generated_at")),
         "generated_at": raw.get("generated_at") if isinstance(raw, dict) else None,
         "model_used": (raw.get("model_used") if isinstance(raw, dict) and raw.get("model_used") else model_used),
+        "agent_used": agent_used or (raw.get("agent_used") if isinstance(raw, dict) and raw.get("agent_used") else None),
+        "selected_agent": normalize_agent_id(selected_agent),
+        "available_agents": available_agents if available_agents is not None else [],
         "deals": raw.get("deals", []) if isinstance(raw, dict) and isinstance(raw.get("deals"), list) else [],
         "limit_advice": raw.get("limit_advice", "") if isinstance(raw, dict) and isinstance(raw.get("limit_advice"), str) else "",
         "limit_projections": live_projections,
@@ -562,7 +792,7 @@ def merge_report(
             "highlights": highlights,
         },
         "sources": raw.get("sources", []) if isinstance(raw, dict) and isinstance(raw.get("sources"), list) else [],
-        "error": error,
+        "error": error or "",
     }
     if isinstance(raw, dict):
         tiers = raw.get("model_tiers")
@@ -582,105 +812,108 @@ def merge_report(
     return report
 
 
-def cmd_read() -> dict[str, Any]:
+def cmd_read(agent: str = "auto") -> dict[str, Any]:
     usage = load_json(USAGE_CACHE)
     projections, highlights = compute_live_projections(usage)
     cached = load_json(INTEL_CACHE)
+    agents = discover_agents(usage)
+    selected = normalize_agent_id(agent)
+    resolved, _ = resolve_agent(selected, agents)
+    default_label = agent_model_label(resolved["id"]) if resolved else "no CLI detected"
     return merge_report(
         cached if isinstance(cached, dict) else None,
         projections,
         highlights,
-        pi_default_model(),
+        default_label,
+        available_agents=agents,
+        selected_agent=selected,
     )
 
 
-def cmd_scan(timeout: int) -> dict[str, Any]:
+def cmd_scan(timeout: int, agent: str = "auto") -> dict[str, Any]:
     usage = load_json(USAGE_CACHE)
     projections, highlights = compute_live_projections(usage)
     cached = load_json(INTEL_CACHE)
-    model_used = pi_default_model()
+    agents = discover_agents(usage)
+    selected = normalize_agent_id(agent)
 
-    pi_bin, env = find_pi()
-    if not pi_bin:
+    resolved, resolve_err = resolve_agent(selected, agents)
+    if resolved is None:
         return merge_report(
             cached if isinstance(cached, dict) else None,
             projections,
             highlights,
-            model_used,
-            error="`pi` CLI not found in PATH or ~/.nvm.",
+            "no CLI detected",
+            available_agents=agents,
+            selected_agent=selected,
+            error=resolve_err or "No supported CLI agent found.",
         )
+
+    agent_id = str(resolved["id"])
+    model_used = agent_model_label(agent_id)
 
     now_dt = datetime.now(timezone.utc)
     dossier = gather_tavily_dossier(now_dt)
     prompt = build_prompt(projections, dossier, now_dt)
 
-    cmd = [
-        pi_bin,
-        "--print",
-        "--no-session",
-        "--no-builtin-tools",
-        "--no-lens",
-        "--no-lsp",
-        "--mode",
-        "text",
-    ]
-    if MCP_CONFIG.is_file():
-        cmd += ["--mcp-config", str(MCP_CONFIG)]
-    cmd += ["--", prompt]
-
-    try:
-        proc = subprocess.run(
-            cmd,
-            env=env,
-            cwd=str(HOME),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
+    raw_out, run_err = run_agent_prompt(resolved, prompt, timeout)
+    if run_err is not None or raw_out is None:
         return merge_report(
             cached if isinstance(cached, dict) else None,
             projections,
             highlights,
             model_used,
-            error=f"pi intel scan timed out after {timeout}s.",
-        )
-    except OSError as exc:
-        return merge_report(
-            cached if isinstance(cached, dict) else None,
-            projections,
-            highlights,
-            model_used,
-            error=f"failed to run pi: {exc}",
+            available_agents=agents,
+            selected_agent=selected,
+            agent_used=agent_id,
+            error=run_err or f"{resolved['label']} CLI returned no output.",
         )
 
-    parsed = extract_json(proc.stdout or "")
+    parsed = extract_json(raw_out)
     if parsed is None:
-        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        msg = detail[-1][:180] if detail else f"pi exited with code {proc.returncode}"
+        lines = raw_out.strip().splitlines()
+        msg = lines[-1][:180] if lines else "empty response"
         return merge_report(
             cached if isinstance(cached, dict) else None,
             projections,
             highlights,
             model_used,
-            error=f"could not parse pi output ({msg})",
+            available_agents=agents,
+            selected_agent=selected,
+            agent_used=agent_id,
+            error=f"could not parse {resolved['label']} CLI output ({msg})",
         )
 
     parsed["generated_at"] = int(time.time())
     parsed["model_used"] = model_used
+    parsed["agent_used"] = agent_id
     save_json_atomic(INTEL_CACHE, parsed)
-    return merge_report(parsed, projections, highlights, model_used)
+    return merge_report(
+        parsed,
+        projections,
+        highlights,
+        model_used,
+        available_agents=agents,
+        selected_agent=selected,
+        agent_used=agent_id,
+    )
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="oasis-intel")
-    parser.add_argument("command", nargs="?", default="read", choices=("read", "scan"))
+    parser.add_argument("command", nargs="?", default="read", choices=("read", "scan", "agents"))
+    parser.add_argument("--agent", default="auto", choices=VALID_AGENT_IDS)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--pretty", action="store_true")
     args = parser.parse_args(argv)
 
-    result = cmd_scan(args.timeout) if args.command == "scan" else cmd_read()
+    if args.command == "agents":
+        usage = load_json(USAGE_CACHE)
+        result: Any = {"ok": True, "agents": discover_agents(usage)}
+    elif args.command == "scan":
+        result = cmd_scan(args.timeout, agent=args.agent)
+    else:
+        result = cmd_read(agent=args.agent)
     print(json.dumps(result, indent=2 if args.pretty else None, ensure_ascii=False))
     return 0
 

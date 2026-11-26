@@ -70,6 +70,7 @@ PlasmoidItem {
         intelReport: root.intelReport
         intelBusy: root.intelLoading
         intelError: root.intelError
+        intelAgent: String(Plasmoid.configuration.intelAgent || "auto")
         accountBusy: root.accountBusy
         accountError: root.accountError
         accountNotice: root.accountNotice
@@ -83,7 +84,10 @@ PlasmoidItem {
         onQuitRequested: root.quit()
         onCloseRequested: root.expanded = false
         onIntelLoadRequested: root.loadIntel()
-        onIntelScanRequested: root.scanIntel()
+        onIntelScanRequested: function(a) { root.scanIntel(a) }
+        onIntelAgentSelected: function(a) {
+            Plasmoid.configuration.intelAgent = String(a || "auto")
+        }
         onSwitchAccountRequested: function(p, a) { root.switchAccount(p, a) }
         onSnapshotAccountRequested: function(p, l) { root.snapshotAccount(p, l) }
         onLaunchLoginRequested: function(p, l) { root.launchAccountLogin(p, l) }
@@ -716,19 +720,22 @@ PlasmoidItem {
             return
         }
         var safePath = root.intelPath().replace(/['\n\r]/g, "")
+        var agent = String(Plasmoid.configuration.intelAgent || "auto")
         intelSource.connectedSources = []
-        intelSource.connectSource("python3 '" + safePath + "' read")
+        intelSource.connectSource("python3 '" + safePath + "' read --agent=" + shellQuote(agent))
     }
 
-    function scanIntel() {
+    function scanIntel(agentId) {
         if (root.intelLoading) {
             return
         }
+        var chosen = String(agentId || Plasmoid.configuration.intelAgent || "auto")
+        Plasmoid.configuration.intelAgent = chosen
         root.intelLoading = true
         root.intelError = ""
         var safePath = root.intelPath().replace(/['\n\r]/g, "")
         intelSource.connectedSources = []
-        intelSource.connectSource("python3 '" + safePath + "' scan")
+        intelSource.connectSource("python3 '" + safePath + "' scan --agent=" + shellQuote(chosen))
     }
 
     function quit() {

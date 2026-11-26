@@ -85,6 +85,7 @@ def test_qmllint_clean_on_new_and_modified_ui() -> None:
     targets = [
         ui_dir / "ProxyPanel.qml",
         ui_dir / "FullRepresentation.qml",
+        ui_dir / "IntelModal.qml",
         ui_dir / "main.qml",
         ui_dir / "configGeneral.qml",
         ui_dir / "AccountsModal.qml",

@@ -41,5 +41,8 @@
     <entry name="showProxyStats" type="Bool">
       <default>true</default>
     </entry>
+    <entry name="intelAgent" type="String">
+      <default>auto</default>
+    </entry>
   </group>
 </kcfg>

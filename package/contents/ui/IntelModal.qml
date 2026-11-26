@@ -12,9 +12,11 @@ ColumnLayout {
     property bool scanning: false
     property string errorText: ""
     property int activeTab: 0
+    property string selectedAgent: "auto"
 
     signal backRequested()
-    signal scanRequested()
+    signal scanRequested(string agentId)
+    signal agentSelected(string agentId)
     signal quitRequested()
 
     readonly property color mutedColor: Qt.rgba(Kirigami.Theme.textColor.r,
@@ -28,6 +30,26 @@ ColumnLayout {
                                                 Kirigami.Theme.textColor.b, 0.11)
 
     readonly property bool hasScan: !!(report && report.has_scan)
+    readonly property var availableAgents: report && report.available_agents ? report.available_agents : []
+    readonly property var selectableAgents: {
+        var out = []
+        for (var i = 0; i < availableAgents.length; ++i) {
+            var a = availableAgents[i]
+            if (a && (a.id === "auto" || a.installed)) {
+                out.push(a)
+            }
+        }
+        return out
+    }
+    readonly property string activeAgentLabel: {
+        for (var i = 0; i < availableAgents.length; ++i) {
+            var a = availableAgents[i]
+            if (a && String(a.id) === String(modal.selectedAgent || "auto")) {
+                return String(a.detail || a.label || a.id)
+            }
+        }
+        return modal.selectedAgent === "auto" ? "Auto" : String(modal.selectedAgent || "Auto")
+    }
     readonly property var deals: report && report.deals ? report.deals : []
     readonly property var projections: report && report.limit_projections ? report.limit_projections : []
     readonly property var mainModels: report && report.model_tiers && report.model_tiers.main_agent
@@ -70,13 +92,13 @@ ColumnLayout {
 
             Text {
                 text: {
-                    if (modal.scanning) return "deep worldwide research via pi + Tavily…"
-                    var m = modal.report && modal.report.model_used ? String(modal.report.model_used) : "pi"
+                    if (modal.scanning) return "deep worldwide research via " + modal.activeAgentLabel + "…"
+                    var m = modal.report && modal.report.model_used ? String(modal.report.model_used) : modal.activeAgentLabel
                     var shortModel = m.indexOf("/") >= 0 ? m.split("/").pop() : m
                     if (modal.hasScan && modal.report.generated_at) {
                         return shortModel + " · Worldwide · " + F.updatedText(F.toMs(modal.report.generated_at), modal.nowMs)
                     }
-                    return shortModel + " · tap Scan for worldwide intel"
+                    return modal.activeAgentLabel + " · tap Scan for worldwide intel"
                 }
                 color: modal.mutedColor
                 font.pixelSize: 9
@@ -93,7 +115,7 @@ ColumnLayout {
             rightPadding: 7
             topPadding: 2
             bottomPadding: 2
-            onClicked: modal.scanRequested()
+            onClicked: modal.scanRequested(modal.selectedAgent)
 
             contentItem: RowLayout {
                 spacing: 4
@@ -119,7 +141,7 @@ ColumnLayout {
                         : Qt.rgba(Kirigami.Theme.highlightColor.r, Kirigami.Theme.highlightColor.g, Kirigami.Theme.highlightColor.b, 0.13)
             }
 
-            QQC2.ToolTip.text: "Run pi (default model) + Tavily web scan"
+            QQC2.ToolTip.text: "Run worldwide AI Intel scan via " + modal.activeAgentLabel
             QQC2.ToolTip.visible: hovered
             QQC2.ToolTip.delay: 400
         }
@@ -148,6 +170,63 @@ ColumnLayout {
             QQC2.ToolTip.text: "Quit Oasis"
             QQC2.ToolTip.visible: hovered
             QQC2.ToolTip.delay: 500
+        }
+    }
+
+    // CLI agent selector row (Auto + every installed CLI agent, incl. Pi)
+    RowLayout {
+        visible: modal.selectableAgents.length > 0
+        Layout.fillWidth: true
+        spacing: 4
+
+        Text {
+            text: "Agent:"
+            color: modal.mutedColor
+            font.pixelSize: 9
+        }
+
+        Flow {
+            Layout.fillWidth: true
+            spacing: 4
+
+            Repeater {
+                model: modal.selectableAgents
+
+                delegate: Rectangle {
+                    required property var modelData
+                    readonly property string aid: String(modelData.id || "")
+                    readonly property bool picked: String(modal.selectedAgent || "auto") === aid
+                    implicitWidth: agTxt.implicitWidth + 10
+                    implicitHeight: 18
+                    radius: 4
+                    activeFocusOnTab: true
+                    Accessible.role: Accessible.RadioButton
+                    Accessible.name: "Use " + String(modelData.detail || modelData.label || aid) + " for AI Intel"
+                    Accessible.checked: picked
+                    color: picked
+                        ? Qt.rgba(Kirigami.Theme.highlightColor.r, Kirigami.Theme.highlightColor.g, Kirigami.Theme.highlightColor.b, 0.22)
+                        : "transparent"
+                    border.width: activeFocus ? 2 : 1
+                    border.color: (picked || activeFocus) ? Kirigami.Theme.highlightColor : modal.cardBorder
+
+                    Keys.onReturnPressed: if (!modal.scanning) modal.agentSelected(aid)
+                    Keys.onSpacePressed: if (!modal.scanning) modal.agentSelected(aid)
+
+                    Text {
+                        id: agTxt
+                        anchors.centerIn: parent
+                        text: aid === "auto" ? String(modelData.detail || "Auto") : String(modelData.label || aid)
+                        color: picked ? Kirigami.Theme.textColor : modal.mutedColor
+                        font.pixelSize: 8
+                        font.bold: picked
+                    }
+
+                    TapHandler {
+                        enabled: !modal.scanning
+                        onTapped: modal.agentSelected(aid)
+                    }
+                }
+            }
         }
     }
 
@@ -243,7 +322,7 @@ ColumnLayout {
                     Text {
                         Layout.fillWidth: true
                         text: modal.scanning
-                            ? "Scouring web with pi + Tavily…"
+                            ? "Scouring web with " + modal.activeAgentLabel + "…"
                             : "No web intel cached yet"
                         color: Kirigami.Theme.textColor
                         font.pixelSize: 11
@@ -255,7 +334,7 @@ ColumnLayout {
                         Layout.fillWidth: true
                         text: modal.scanning
                             ? "Checking active discounts, retention offers, Diamond/Gold/Silver model tiers, and provider updates."
-                            : "Click Scan to query pi's default model + Tavily for current deals, retention offers, Diamond/Gold/Silver model rankings, and market alerts."
+                            : "Choose any installed CLI agent above (or Auto) and click Scan for current deals, retention offers, Diamond/Gold/Silver model rankings, and market alerts."
                         color: modal.mutedColor
                         font.pixelSize: 10
                         wrapMode: Text.WordWrap
@@ -265,9 +344,9 @@ ColumnLayout {
                     QQC2.Button {
                         Layout.alignment: Qt.AlignHCenter
                         visible: !modal.scanning
-                        text: "Scan with pi + Tavily"
+                        text: "Scan with " + modal.activeAgentLabel
                         icon.name: "view-refresh"
-                        onClicked: modal.scanRequested()
+                        onClicked: modal.scanRequested(modal.selectedAgent)
                     }
                 }
             }

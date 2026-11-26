@@ -50,8 +50,6 @@ search **Oasis** in the application launcher to put it back in the system tray.
 | :---: | :---: |
 | <img src="docs/proxy.png" alt="Oasis Proxy panel with model catalog, thinking modes, account pinning, and tier routing" width="430"> | <img src="docs/intel.png" alt="Oasis AI Intel modal with Pareto frontier chart and Diamond/Gold/Silver tiers" width="430"> |
 
-*(All screenshots above use seeded demo data — no real accounts or credentials.)*
-
 ## Provider coverage
 
 | Provider | Credential source (read-only) | Windows shown |
@@ -150,8 +148,10 @@ or Claude when a period/trial end date is returned), remaining subscription time
 appears subtly beside the plan name.
 
 Click **✦ Intel** in the popup header to open the integrated **AI Intel** modal,
-which invokes `pi` (using your configured default model + Tavily MCP web search)
-on demand to compile a compact tabbed brief: **Tiers** (Diamond / Gold / Silver
+which runs on demand using **any installed CLI agent at its disposal** (`Claude Code`,
+`Codex`, `OpenCode`, `Gemini CLI`, `Pi`, `Qwen`, or `Kimi` — either **Auto**-selected
+or explicitly chosen right inside the modal / widget settings, plus optional Tavily web search)
+to compile a compact tabbed brief: **Tiers** (Diamond / Gold / Silver
 models for Main Agent and Subagent by cost per task and current consensus),
 **Deals** (active discounts, free months, and cancel/retention offers with
 country and audience tags), **Limits** (live pace projections and subscription

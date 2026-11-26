@@ -18,6 +18,7 @@ Kirigami.FormLayout {
     property alias cfg_proxyPort: proxyPort.value
     property alias cfg_proxyBinaryPath: proxyBinaryPath.text
     property alias cfg_showProxyStats: showProxyStats.checked
+    property string cfg_intelAgent: "auto"
 
     QQC2.SpinBox {
         id: refresh
@@ -148,5 +149,34 @@ Kirigami.FormLayout {
         wrapMode: Text.WordWrap
         font: Kirigami.Theme.smallFont
         opacity: 0.7
+    }
+
+    Item {
+        Kirigami.FormData.isSection: true
+    }
+
+    QQC2.ComboBox {
+        id: intelAgentCombo
+        Kirigami.FormData.label: "AI Intel CLI agent:"
+        readonly property var agentIds: ["auto", "claude", "codex", "opencode", "gemini", "pi", "qwen", "kimi"]
+        model: [
+            "Auto (best installed CLI)",
+            "Claude Code (claude)",
+            "OpenAI Codex (codex)",
+            "OpenCode (opencode)",
+            "Gemini CLI (gemini)",
+            "Pi Agent (pi)",
+            "Qwen Code (qwen)",
+            "Kimi CLI (kimi)"
+        ]
+        currentIndex: {
+            var idx = agentIds.indexOf(page.cfg_intelAgent)
+            return idx >= 0 ? idx : 0
+        }
+        onActivated: function(index) {
+            if (index >= 0 && index < agentIds.length) {
+                page.cfg_intelAgent = agentIds[index]
+            }
+        }
     }
 }
