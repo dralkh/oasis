@@ -5,7 +5,7 @@
 [![Python Stdlib](https://img.shields.io/badge/Python-3%20stdlib%20only-3776AB?logo=python&logoColor=white)](#security-model-short-version)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Lightweight, auditable **KDE Plasma 6 panel widget** (Linux **CodexBar alternative** with zero external binaries) showing live 5-hour, weekly, and monthly rate limits, reset countdowns, available usage-reset passes, subscription countdowns, desktop limit alerts, and an integrated **AI Intel** modal with a **Capability vs. Cost/Task Pareto graph** for:
+Lightweight, auditable **KDE Plasma 6 panel widget** (Linux **CodexBar alternative** with zero external binaries) showing live 5-hour, weekly, and monthly rate limits, **live on-the-fly multi-account switching** (reflecting directly in your CLI agents), reset countdowns, available usage-reset passes, subscription countdowns, desktop limit alerts, and an integrated **AI Intel** modal with a **Capability vs. Cost/Task Pareto graph** for:
 
 **OpenAI Codex · Claude Code · Google Antigravity (Gemini & Claude) · OpenCode Go · Qwen · Muse Code · Kimi Code · Grok · Cursor**
 
@@ -66,12 +66,12 @@ Requirements: **KDE Plasma 6**, Python 3 (stdlib only), `secret-tool` (`libsecre
 
 ### Option 1: Prebuilt `.plasmoid` (GitHub Releases)
 
-Download `oasis-1.2.0.plasmoid` from [GitHub Releases](https://github.com/dralkh/oasis/releases/latest) and run:
+Download `oasis-1.3.0.plasmoid` from [GitHub Releases](https://github.com/dralkh/oasis/releases/latest) and run:
 
 ```sh
-kpackagetool6 -t Plasma/Applet -i oasis-1.2.0.plasmoid
+kpackagetool6 -t Plasma/Applet -i oasis-1.3.0.plasmoid
 # or upgrade an existing install:
-kpackagetool6 -t Plasma/Applet -u oasis-1.2.0.plasmoid
+kpackagetool6 -t Plasma/Applet -u oasis-1.3.0.plasmoid
 ```
 
 ### Option 2: From Source (includes Application Launcher entry)
@@ -151,6 +151,35 @@ underneath the model name. Signed-out providers collapse into a single footer
 line with tooltips (no per-provider setup paragraphs), so four active providers
 plus four signed-out ones fit in about 400 px instead of 760 px.
 
+## Multi-account switching (live CLI sync)
+
+Oasis lets you save, add, preview, and switch accounts on the fly for all CLI
+providers (**Codex, Claude Code, Antigravity, OpenCode Go, Qwen, Muse Code,
+Kimi Code, Grok**), updating each CLI's active credential store directly:
+
+* **Inline switcher:** Click the account pill on any provider row in the popup
+  to expand all saved accounts with **live usage previews** (so you can see
+  which account still has quota left before switching). Clicking an account
+  switches the CLI's live credential immediately and refreshes usage.
+* **Add & manage (`⇄ Accounts`):** Click **⇄ Accounts** in the popup header (or
+  **+ Add account** / a signed-out CLI provider in the footer) to:
+  * **Sign in via native CLI login** (`codex login`, `claude auth login`,
+    `agy`, `opencode auth login -p opencode-go`, `qwen`, `muse login`, `kimi`,
+    `grok login`) — Oasis snapshots your current active sign-in first so nothing
+    is lost, runs the CLI login in a terminal, saves & activates the new
+    account, and automatically restores your previous account if you cancel.
+  * **Save active CLI sign-in** into the local vault (`~/.config/oasis/accounts`,
+    mode `0700`/`0600`) with an optional custom label.
+  * **Add API keys directly** for key-based providers (OpenCode Go, Qwen, Kimi
+    with region selection).
+  * **Rename or remove** saved accounts.
+* **OpenCode Go native DB:** Existing multi-account entries in
+  `~/.local/share/opencode/opencode.db` appear automatically and switch via
+  `opencode auth switch opencode-go <id>`.
+* **Safe token sync:** Before switching away from an active account, Oasis
+  syncs the live credential back to its vault snapshot so CLI-rotated refresh
+  tokens are never lost.
+
 ## Limit notifications
 
 `notify-send` delivers a local desktop notification when a provider window
@@ -169,27 +198,32 @@ re-arms. Toggle it under **Notifications** in the widget settings.
 
 ## Security model (short version)
 
-* Codex/Grok/Cursor credential files are opened **read-only**. Their refresh
-  tokens rotate, so refreshing them behind the owning CLI's back can log you
-  out — the widget deliberately does not do it and shows `expired` until the
-  real client renews.
+* Background polling (`ai_limits.py`) opens Codex/Grok/Cursor/Muse/Kimi/Qwen/OpenCode
+  credential files **read-only**. Codex/Grok/Cursor refresh tokens rotate, so
+  Oasis never refreshes them behind the owning CLI's back and shows `expired`
+  until the real client renews.
 * Claude Code access tokens expire every ~8 hours. When expired, the helper
   acquires Claude Code's own lock directories (`.oauth_refresh.lock` and
   `.claude.lock`), refreshes via `https://platform.claude.com/v1/oauth/token`,
   and atomically updates `~/.claude/.credentials.json` with a compare-and-swap
   check so running Claude sessions stay signed in.
 * Antigravity refreshes its non-rotating Google OAuth token into a private
-  short-lived cache at `~/.cache/ai-limits/antigravity.json` (mode 0600). The
-  refresh token is never copied there.
-* The only other write is `~/.cache/ai-limits/last.json` (0600): percentages,
-  plan names and reset timestamps, so a network failure shows stale numbers
-  instead of blanks.
+  short-lived cache at `~/.cache/ai-limits/antigravity*.json` (mode `0600`).
+  The refresh token is never copied there.
+* Multi-account switching (`oasis_accounts.py`) stores metadata (no secrets) in
+  `~/.config/oasis/accounts/index.json` (`0600`) and credential snapshots in
+  `~/.config/oasis/accounts/secrets/` (`0700`/`0600`). Live CLI credential files,
+  `opencode.db`, or Secret Service (`secret-tool store` via stdin) are updated
+  **only** when you explicitly switch, add an API key, or complete a login.
+* Usage cache is written to `~/.cache/ai-limits/last.json` (`0600`): percentages,
+  account labels (never tokens), plan names, and reset timestamps, so a network
+  failure shows stale numbers instead of blanks.
 * Every request is pinned to an explicit host allowlist, redirects are refused
   (otherwise urllib would forward `Authorization` to a 30x target), and
   environment proxies are ignored.
 * No telemetry. No analytics. No auto-update. No external CLI, no downloaded
   binaries, no `pip install`, no `curl | bash`.
-* The helper is ~950 lines of stdlib Python; the UI is plain QML. There is no
+* The helpers are stdlib Python 3 only; the UI is plain QML. There is no
   compiled artifact to trust.
 
 See [SECURITY.md](SECURITY.md) for the full data-flow table, threat model and
@@ -222,6 +256,9 @@ usage shapes. The code here is original.
 ```sh
 # what the helper can see (paths and presence only, never values)
 python3 package/contents/code/ai_limits.py selftest
+
+# list detected & saved accounts across all CLI providers (metadata only, never secrets)
+python3 package/contents/code/oasis_accounts.py list --pretty
 
 # the exact JSON the panel consumes
 python3 package/contents/code/ai_limits.py fetch --pretty

@@ -18,12 +18,33 @@ Item {
     property bool intelBusy: false
     property string intelError: ""
     property bool intelOpen: false
+    property bool accountBusy: false
+    property string accountError: ""
+    property string accountNotice: ""
+    property bool accountsOpen: false
+    property string accountsProviderId: "codex"
 
     signal refreshRequested()
     signal quitRequested()
     signal closeRequested()
     signal intelLoadRequested()
     signal intelScanRequested()
+    signal switchAccountRequested(string providerId, string accountId)
+    signal snapshotAccountRequested(string providerId, string label)
+    signal launchLoginRequested(string providerId, string label)
+    signal addApiKeyRequested(string providerId, string label, string apiKey, string region)
+    signal renameAccountRequested(string providerId, string accountId, string newLabel)
+    signal removeAccountRequested(string providerId, string accountId)
+    signal clearAccountMessagesRequested()
+
+    function openAccounts(providerId) {
+        if (providerId && providerId.length > 0) {
+            full.accountsProviderId = providerId
+        }
+        full.intelOpen = false
+        full.accountsOpen = true
+        full.clearAccountMessagesRequested()
+    }
 
     readonly property color mutedColor: Qt.rgba(Kirigami.Theme.textColor.r,
                                                 Kirigami.Theme.textColor.g,
@@ -70,16 +91,18 @@ Item {
 
     Layout.minimumWidth: full.intelOpen
         ? Kirigami.Units.gridUnit * 28
-        : Kirigami.Units.gridUnit * 24
+        : (full.accountsOpen ? Kirigami.Units.gridUnit * 26 : Kirigami.Units.gridUnit * 24)
     Layout.preferredWidth: full.intelOpen
         ? Kirigami.Units.gridUnit * 31
-        : Kirigami.Units.gridUnit * 26
+        : (full.accountsOpen ? Kirigami.Units.gridUnit * 28 : Kirigami.Units.gridUnit * 26)
     Layout.minimumHeight: Math.min(Layout.preferredHeight, maxPopupHeight)
     Layout.preferredHeight: full.intelOpen
         ? Kirigami.Units.gridUnit * 30
-        : Math.min(
-            Math.max(content.implicitHeight + popupMargin * 2, Kirigami.Units.gridUnit * 6),
-            maxPopupHeight)
+        : (full.accountsOpen
+            ? Kirigami.Units.gridUnit * 29
+            : Math.min(
+                Math.max(content.implicitHeight + popupMargin * 2, Kirigami.Units.gridUnit * 6),
+                maxPopupHeight))
     Layout.maximumHeight: Layout.preferredHeight
 
     IntelModal {
@@ -96,11 +119,36 @@ Item {
         onQuitRequested: full.quitRequested()
     }
 
+    AccountsModal {
+        id: accountsView
+        anchors.fill: parent
+        anchors.margins: full.popupMargin
+        visible: full.accountsOpen
+        providers: full.providers
+        selectedProviderId: full.accountsProviderId
+        nowMs: full.nowMs
+        warnThreshold: full.warnThreshold
+        criticalThreshold: full.criticalThreshold
+        busy: full.accountBusy || full.busy
+        errorText: full.accountError
+        noticeText: full.accountNotice
+        onSelectedProviderIdChanged: full.accountsProviderId = selectedProviderId
+        onBackRequested: full.accountsOpen = false
+        onRefreshRequested: full.refreshRequested()
+        onQuitRequested: full.quitRequested()
+        onSwitchAccountRequested: function(p, a) { full.switchAccountRequested(p, a) }
+        onSnapshotAccountRequested: function(p, l) { full.snapshotAccountRequested(p, l) }
+        onLaunchLoginRequested: function(p, l) { full.launchLoginRequested(p, l) }
+        onAddApiKeyRequested: function(p, l, k, r) { full.addApiKeyRequested(p, l, k, r) }
+        onRenameAccountRequested: function(p, a, l) { full.renameAccountRequested(p, a, l) }
+        onRemoveAccountRequested: function(p, a) { full.removeAccountRequested(p, a) }
+    }
+
     ColumnLayout {
         id: content
         anchors.fill: parent
         anchors.margins: full.popupMargin
-        visible: !full.intelOpen
+        visible: !full.intelOpen && !full.accountsOpen
         spacing: 4
 
         RowLayout {
@@ -125,6 +173,44 @@ Item {
             }
 
             QQC2.ToolButton {
+                id: accountsButton
+                implicitHeight: 22
+                leftPadding: 6
+                rightPadding: 6
+                topPadding: 2
+                bottomPadding: 2
+                onClicked: {
+                    var defaultPid = full.mainProviders.length > 0 && full.mainProviders[0].supports_accounts
+                        ? full.mainProviders[0].id
+                        : "codex"
+                    full.openAccounts(defaultPid)
+                }
+
+                contentItem: Text {
+                    text: full.accountBusy ? "⇄ …" : "⇄ Accounts"
+                    color: accountsButton.hovered
+                        ? Kirigami.Theme.highlightColor
+                        : Kirigami.Theme.textColor
+                    font.pixelSize: 10
+                    font.bold: true
+                    verticalAlignment: Text.AlignVCenter
+                }
+
+                background: Rectangle {
+                    radius: 4
+                    color: accountsButton.down
+                        ? Qt.rgba(Kirigami.Theme.highlightColor.r, Kirigami.Theme.highlightColor.g, Kirigami.Theme.highlightColor.b, 0.24)
+                        : accountsButton.hovered
+                            ? Qt.rgba(Kirigami.Theme.highlightColor.r, Kirigami.Theme.highlightColor.g, Kirigami.Theme.highlightColor.b, 0.16)
+                            : Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.08)
+                }
+
+                QQC2.ToolTip.text: "Add & switch CLI accounts on the fly"
+                QQC2.ToolTip.visible: hovered
+                QQC2.ToolTip.delay: 500
+            }
+
+            QQC2.ToolButton {
                 id: intelButton
                 implicitHeight: 22
                 leftPadding: 6
@@ -132,6 +218,7 @@ Item {
                 topPadding: 2
                 bottomPadding: 2
                 onClicked: {
+                    full.accountsOpen = false
                     full.intelOpen = true
                     full.intelLoadRequested()
                 }
@@ -224,11 +311,29 @@ Item {
 
         Text {
             Layout.fillWidth: true
-            visible: full.errorText.length > 0
-            text: full.errorText
+            visible: full.errorText.length > 0 || full.accountError.length > 0
+            text: full.accountError.length > 0 ? full.accountError : full.errorText
             color: Kirigami.Theme.negativeTextColor
             font.pixelSize: 10
             wrapMode: Text.WordWrap
+        }
+
+        Rectangle {
+            Layout.fillWidth: true
+            visible: full.accountNotice.length > 0 && full.accountError.length === 0
+            radius: 4
+            implicitHeight: mainNoticeText.implicitHeight + 6
+            color: Qt.rgba(Kirigami.Theme.positiveTextColor.r, Kirigami.Theme.positiveTextColor.g, Kirigami.Theme.positiveTextColor.b, 0.14)
+
+            Text {
+                id: mainNoticeText
+                anchors.fill: parent
+                anchors.margins: 3
+                text: full.accountNotice
+                color: Kirigami.Theme.positiveTextColor
+                font.pixelSize: 10
+                wrapMode: Text.WordWrap
+            }
         }
 
         ListView {
@@ -260,6 +365,9 @@ Item {
                 nowMs: full.nowMs
                 warnThreshold: full.warnThreshold
                 criticalThreshold: full.criticalThreshold
+                accountBusy: full.accountBusy
+                onSwitchAccountRequested: function(p, a) { full.switchAccountRequested(p, a) }
+                onManageAccountsRequested: function(p) { full.openAccounts(p) }
             }
 
             footer: ColumnLayout {
@@ -323,7 +431,9 @@ Item {
 
                             Text {
                                 text: F.meta(modelData.id).name
-                                color: full.mutedColor
+                                color: signedOutHover.hovered && modelData.supports_accounts
+                                    ? Kirigami.Theme.highlightColor
+                                    : full.mutedColor
                                 font.pixelSize: 10
                             }
 
@@ -331,9 +441,16 @@ Item {
                                 id: signedOutHover
                             }
 
+                            TapHandler {
+                                enabled: !!modelData.supports_accounts
+                                onTapped: full.openAccounts(modelData.id)
+                            }
+
                             QQC2.ToolTip.visible: signedOutHover.hovered
                             QQC2.ToolTip.delay: 600
-                            QQC2.ToolTip.text: modelData.hint || "Not signed in"
+                            QQC2.ToolTip.text: modelData.supports_accounts
+                                ? (modelData.hint ? modelData.hint + " (click to sign in / add)" : "Click to sign in or add account")
+                                : (modelData.hint || "Not signed in")
                         }
                     }
                 }

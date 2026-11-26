@@ -668,3 +668,50 @@ function updatedText(ts, now) {
     if (minutes < 60) return minutes + "m ago";
     return Math.round(minutes / 60) + "h ago";
 }
+
+// Compact label for an inline account switcher pill (e.g. "dralkh@proton.me" -> "dralkh").
+function shortAccountLabel(label) {
+    var s = String(label || "").trim();
+    if (!s) return "Account";
+    var at = s.indexOf("@");
+    if (at > 0 && s.length > 14) {
+        s = s.substring(0, at);
+    }
+    if (s.length > 16) {
+        s = s.substring(0, 15) + "…";
+    }
+    return s;
+}
+
+// Compact live usage preview badges for a saved account row.
+function accountPreviewChips(account, now) {
+    if (!account) return [];
+    if (account.status !== "ok") return [];
+    var windows = primaryWindows(account);
+    if (!windows.length) return [];
+    var out = [];
+    // Keep at most 3 chips (5h, 1w, 1mo or Gemini/Claude).
+    for (var i = 0; i < windows.length && out.length < 3; i++) {
+        var w = windows[i];
+        var used = Number(w.used) || 0;
+        var ready = windowResetAvailable(w, now) || isIdle(w);
+        out.push({
+            label: w.short || w.label || "",
+            text: (w.short ? w.short + " " : "") + round(used) + "%",
+            used: used,
+            ready: ready,
+            reset: resetShort(w, now)
+        });
+    }
+    return out;
+}
+
+function accountStatusBadge(account) {
+    if (!account) return "";
+    if (account.stale) return "stale";
+    if (account.status === "expired") return "expired";
+    if (account.status === "error") return account.error ? String(account.error) : "error";
+    if (account.status === "not_configured") return "signed out";
+    if (account.status === "ok" && (!account.windows || !account.windows.length)) return "ready";
+    return "";
+}

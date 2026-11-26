@@ -1,8 +1,8 @@
 # Maintainer: dralk <https://github.com/dralkh>
 pkgname=plasma6-applets-oasis
-pkgver=1.2.0
+pkgver=1.3.0
 pkgrel=1
-pkgdesc="KDE Plasma 6 panel widget for AI coding CLI usage limits, reset credits, subscription countdowns & AI Intel (Codex, Claude Code, Antigravity, OpenCode Go, Qwen, Cursor, Kimi, Grok, Muse)"
+pkgdesc="KDE Plasma 6 panel widget for AI coding CLI usage limits, live multi-account switching, reset credits, subscription countdowns & AI Intel (Codex, Claude Code, Antigravity, OpenCode Go, Qwen, Cursor, Kimi, Grok, Muse)"
 arch=('any')
 url="https://github.com/dralkh/oasis"
 license=('MIT')
@@ -22,7 +22,8 @@ package() {
     find "${dest}" -type d -name '__pycache__' -exec rm -rf {} +
     chmod 755 "${dest}/contents/code/ai_limits.py" \
               "${dest}/contents/code/oasisctl.py" \
-              "${dest}/contents/code/oasis_intel.py"
+              "${dest}/contents/code/oasis_intel.py" \
+              "${dest}/contents/code/oasis_accounts.py"
 
     install -Dm644 package/contents/icons/ai-limits.svg \
         "${pkgdir}/usr/share/icons/hicolor/scalable/apps/org.dralk.ailimits.svg"

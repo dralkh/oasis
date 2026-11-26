@@ -19,6 +19,11 @@ PlasmoidItem {
     property var intelReport: null
     property bool intelLoading: false
     property string intelError: ""
+    property bool accountBusy: false
+    property string accountError: ""
+    property string accountNotice: ""
+    property string pendingAccountAction: ""
+    property bool refreshQueued: false
 
     readonly property var providers: payload && payload.providers ? payload.providers : []
 
@@ -59,11 +64,24 @@ PlasmoidItem {
         intelReport: root.intelReport
         intelBusy: root.intelLoading
         intelError: root.intelError
+        accountBusy: root.accountBusy
+        accountError: root.accountError
+        accountNotice: root.accountNotice
         onRefreshRequested: root.refresh()
         onQuitRequested: root.quit()
         onCloseRequested: root.expanded = false
         onIntelLoadRequested: root.loadIntel()
         onIntelScanRequested: root.scanIntel()
+        onSwitchAccountRequested: function(p, a) { root.switchAccount(p, a) }
+        onSnapshotAccountRequested: function(p, l) { root.snapshotAccount(p, l) }
+        onLaunchLoginRequested: function(p, l) { root.launchAccountLogin(p, l) }
+        onAddApiKeyRequested: function(p, l, k, r) { root.addApiKeyAccount(p, l, k, r) }
+        onRenameAccountRequested: function(p, a, l) { root.renameAccount(p, a, l) }
+        onRemoveAccountRequested: function(p, a) { root.removeAccount(p, a) }
+        onClearAccountMessagesRequested: {
+            root.accountError = ""
+            root.accountNotice = ""
+        }
     }
 
     Plasma5Support.DataSource {
@@ -83,6 +101,10 @@ PlasmoidItem {
                 root.lastError = code
                     ? "helper failed (exit " + code + ")" + (detail ? ": " + detail : "")
                     : "helper returned no data"
+                if (root.refreshQueued) {
+                    root.refreshQueued = false
+                    root.refresh()
+                }
                 return
             }
             try {
@@ -98,6 +120,10 @@ PlasmoidItem {
                 root.checkLimitNotifications(document.providers || [])
             } catch (error) {
                 root.lastError = "invalid helper output"
+            }
+            if (root.refreshQueued) {
+                root.refreshQueued = false
+                root.refresh()
             }
         }
     }
@@ -160,6 +186,83 @@ PlasmoidItem {
                 root.intelError = "invalid intel output"
             }
         }
+    }
+
+    // Multi-account manager runner (switch, snapshot, add-key, launch-login, rename, remove).
+    Plasma5Support.DataSource {
+        id: accountSource
+        engine: "executable"
+        onNewData: function(sourceName, data) {
+            if (accountSource.connectedSources.indexOf(sourceName) === -1) {
+                return
+            }
+            accountSource.disconnectSource(sourceName)
+            var action = root.pendingAccountAction
+            root.pendingAccountAction = ""
+            root.accountBusy = false
+
+            var output = (data.stdout || "").trim()
+            var detail = (data.stderr || "").trim()
+            if (output.length === 0) {
+                root.accountError = detail.length > 0 ? detail : "account helper returned no data"
+                return
+            }
+            try {
+                var doc = JSON.parse(output)
+                if (!doc || doc.ok === false) {
+                    root.accountError = doc && doc.error ? String(doc.error) : "account action failed"
+                    return
+                }
+                root.accountError = ""
+                var pName = doc.provider ? F.meta(doc.provider).name : ""
+                var lbl = doc.label ? String(doc.label) : ""
+                if (action === "switch") {
+                    root.accountNotice = "Switched " + pName + " → " + lbl + " (CLI updated)"
+                    root.clearLimitStateForProvider(doc.provider)
+                    root.refresh()
+                } else if (action === "add-key") {
+                    root.accountNotice = "Added & activated " + pName + " → " + lbl
+                    root.clearLimitStateForProvider(doc.provider)
+                    root.refresh()
+                } else if (action === "snapshot") {
+                    root.accountNotice = "Saved " + pName + " account: " + lbl
+                    root.refresh()
+                } else if (action === "launch-login") {
+                    root.accountNotice = doc.message
+                        ? String(doc.message) + " Refresh once finished."
+                        : "Opened terminal for login. Refresh once finished."
+                } else if (action === "rename") {
+                    root.accountNotice = "Renamed account to " + lbl
+                    root.refresh()
+                } else if (action === "remove") {
+                    root.accountNotice = "Removed saved " + pName + " account"
+                    root.refresh()
+                } else {
+                    root.refresh()
+                }
+                noticeTimer.restart()
+            } catch (error) {
+                root.accountError = detail.length > 0 ? detail : "invalid account helper output"
+            }
+        }
+    }
+
+    Timer {
+        interval: 20000
+        running: root.accountBusy
+        onTriggered: {
+            accountSource.connectedSources = []
+            root.accountBusy = false
+            root.pendingAccountAction = ""
+            root.accountError = "account action timed out"
+        }
+    }
+
+    Timer {
+        id: noticeTimer
+        interval: 5500
+        repeat: false
+        onTriggered: root.accountNotice = ""
     }
 
     Timer {
@@ -228,6 +331,93 @@ PlasmoidItem {
         return localFilePath(Qt.resolvedUrl("../code/oasis_intel.py"))
     }
 
+    function accountsPath() {
+        return localFilePath(Qt.resolvedUrl("../code/oasis_accounts.py"))
+    }
+
+    function clearLimitStateForProvider(providerId) {
+        if (!providerId) {
+            return
+        }
+        var next = {}
+        var prefix = String(providerId) + ":"
+        for (var key in root.notifiedLimits) {
+            if (key.indexOf(prefix) !== 0) {
+                next[key] = root.notifiedLimits[key]
+            }
+        }
+        root.notifiedLimits = next
+    }
+
+    function runAccountCommand(action, commandLine) {
+        if (root.accountBusy) {
+            return
+        }
+        root.accountBusy = true
+        root.accountError = ""
+        root.accountNotice = ""
+        root.pendingAccountAction = action
+        accountSource.connectedSources = []
+        accountSource.connectSource(commandLine)
+    }
+
+    function switchAccount(providerId, accountId) {
+        var safePath = root.accountsPath().replace(/['\n\r]/g, "")
+        runAccountCommand(
+            "switch",
+            "python3 '" + safePath + "' switch --provider "
+                + shellQuote(providerId) + " --account " + shellQuote(accountId))
+    }
+
+    function snapshotAccount(providerId, label) {
+        var safePath = root.accountsPath().replace(/['\n\r]/g, "")
+        var cmd = "python3 '" + safePath + "' snapshot --provider " + shellQuote(providerId)
+        if (label && label.length > 0) {
+            cmd += " --label " + shellQuote(label)
+        }
+        runAccountCommand("snapshot", cmd)
+    }
+
+    function launchAccountLogin(providerId, label) {
+        var safePath = root.accountsPath().replace(/['\n\r]/g, "")
+        var cmd = "python3 '" + safePath + "' launch-login --provider " + shellQuote(providerId)
+        if (label && label.length > 0) {
+            cmd += " --label " + shellQuote(label)
+        }
+        runAccountCommand("launch-login", cmd)
+    }
+
+    function addApiKeyAccount(providerId, label, apiKey, region) {
+        var safePath = root.accountsPath().replace(/['\n\r]/g, "")
+        var b64 = Qt.btoa(unescape(encodeURIComponent(String(apiKey || ""))))
+        var cmd = "printf '%s' " + shellQuote(b64) + " | base64 -d | python3 '" + safePath
+            + "' add-key --provider " + shellQuote(providerId)
+        if (label && label.length > 0) {
+            cmd += " --label " + shellQuote(label)
+        }
+        if (region && region.length > 0) {
+            cmd += " --region " + shellQuote(region)
+        }
+        runAccountCommand("add-key", cmd)
+    }
+
+    function renameAccount(providerId, accountId, newLabel) {
+        var safePath = root.accountsPath().replace(/['\n\r]/g, "")
+        runAccountCommand(
+            "rename",
+            "python3 '" + safePath + "' rename --provider "
+                + shellQuote(providerId) + " --account " + shellQuote(accountId)
+                + " --label " + shellQuote(newLabel))
+    }
+
+    function removeAccount(providerId, accountId) {
+        var safePath = root.accountsPath().replace(/['\n\r]/g, "")
+        runAccountCommand(
+            "remove",
+            "python3 '" + safePath + "' remove --provider "
+                + shellQuote(providerId) + " --account " + shellQuote(accountId))
+    }
+
     function loadIntel() {
         if (root.intelLoading) {
             return
@@ -286,6 +476,7 @@ PlasmoidItem {
 
     function refresh() {
         if (root.loading) {
+            root.refreshQueued = true
             return
         }
         root.loading = true
@@ -332,6 +523,9 @@ PlasmoidItem {
         for (var i = 0; i < root.providers.length; i++) {
             var provider = root.providers[i]
             var name = F.meta(provider.id).name
+            if (provider.account && provider.accounts && provider.accounts.length > 1) {
+                name += " (" + F.shortAccountLabel(provider.account) + ")"
+            }
             if (provider.status !== "ok") {
                 lines.push(name + " · " + F.statusText(provider))
                 continue

@@ -22,6 +22,7 @@ helper="$installed/contents/code/ai_limits.py"
 chmod 0755 "$helper" 2>/dev/null || true
 chmod 0755 "$installed/contents/code/oasisctl.py" 2>/dev/null || true
 chmod 0755 "$installed/contents/code/oasis_intel.py" 2>/dev/null || true
+chmod 0755 "$installed/contents/code/oasis_accounts.py" 2>/dev/null || true
 
 # Launcher entry. Oasis is a tray applet, so this adds it to the tray panel
 # instead of opening a separate window.

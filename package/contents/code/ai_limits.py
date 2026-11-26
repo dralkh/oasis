@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 UA = f"ai-limits-kde/{VERSION}"
 
 HOME = Path.home()
@@ -231,6 +231,10 @@ class Provider:
     hint: Optional[str] = None
     error: Optional[str] = None
     stale: bool = False
+    account: Optional[str] = None
+    account_id: Optional[str] = None
+    accounts: list[dict[str, Any]] = field(default_factory=list)
+    supports_accounts: bool = False
 
 
 def load_json(path: Path) -> Any:
@@ -399,26 +403,14 @@ def _codex_subscription(headers: dict[str, str], account: str) -> Optional[Subsc
     return Subscription(ends_at=ends_at, renews=will_renew, status=sub_status, period=period_str)
 
 
-def fetch_codex() -> Provider:
+def _codex_fetch_with_token(
+    token: str,
+    account: str,
+    plan: Optional[str] = None,
+    *,
+    include_extras: bool = True,
+) -> Provider:
     provider = Provider("codex", "Codex")
-    token = ""
-    account = ""
-    plan = None
-
-    doc = load_json(Path(os.environ.get("CODEX_HOME") or (HOME / ".codex")) / "auth.json")
-    if isinstance(doc, dict):
-        tokens = doc.get("tokens") if isinstance(doc.get("tokens"), dict) else {}
-        token = tokens.get("access_token") or ""
-        account = tokens.get("account_id") or ""
-        plan = doc.get("plan_type") if isinstance(doc.get("plan_type"), str) else None
-
-    if not token:
-        auth = load_json(Path(os.environ.get("XDG_DATA_HOME") or (HOME / ".local/share")) / "opencode" / "auth.json")
-        entry = auth.get("openai") if isinstance(auth, dict) else None
-        if isinstance(entry, dict) and entry.get("type") == "oauth":
-            token = entry.get("access") or ""
-            account = entry.get("accountId") or entry.get("account_id") or ""
-
     if not token:
         provider.status = "not_configured"
         provider.hint = "Sign in with `codex login`."
@@ -482,13 +474,36 @@ def fetch_codex() -> Provider:
             reset = int(time.time() + after) if after is not None else None
         provider.windows.append(Window(key, key if key != "Week" else "Weekly", short_label, clamp(used), reset, period))
 
-    provider.resets = _codex_reset_credits(headers, data)
-    provider.subscription = _codex_subscription(headers, account)
+    if include_extras:
+        provider.resets = _codex_reset_credits(headers, data)
+        provider.subscription = _codex_subscription(headers, account)
 
     if not provider.windows:
         provider.status = "error"
         provider.error = "no quota windows in response"
     return provider
+
+
+def fetch_codex() -> Provider:
+    token = ""
+    account = ""
+    plan = None
+
+    doc = load_json(Path(os.environ.get("CODEX_HOME") or (HOME / ".codex")) / "auth.json")
+    if isinstance(doc, dict):
+        tokens = doc.get("tokens") if isinstance(doc.get("tokens"), dict) else {}
+        token = tokens.get("access_token") or ""
+        account = tokens.get("account_id") or ""
+        plan = doc.get("plan_type") if isinstance(doc.get("plan_type"), str) else None
+
+    if not token:
+        auth = load_json(Path(os.environ.get("XDG_DATA_HOME") or (HOME / ".local/share")) / "opencode" / "auth.json")
+        entry = auth.get("openai") if isinstance(auth, dict) else None
+        if isinstance(entry, dict) and entry.get("type") == "oauth":
+            token = entry.get("access") or ""
+            account = entry.get("accountId") or entry.get("account_id") or ""
+
+    return _codex_fetch_with_token(token, account, plan, include_extras=True)
 
 
 # ---------------------------------------------------------------------------
@@ -734,6 +749,145 @@ def _claude_subscription(access_token: str) -> Optional[Subscription]:
     return Subscription(ends_at=ends_at, renews=renews, status=sub_status, period="monthly")
 
 
+def _claude_populate_provider(
+    provider: Provider,
+    oauth: dict[str, Any],
+    data: dict[str, Any],
+    access: str,
+    *,
+    include_extras: bool = True,
+) -> Provider:
+    scopes = oauth.get("scopes")
+    if isinstance(scopes, list) and "user:profile" not in scopes:
+        provider.hint = "Token lacks the user:profile scope; re-login with `claude`."
+    plan = oauth.get("subscriptionType")
+    if isinstance(plan, str):
+        provider.plan = plan.capitalize()
+
+    for key, label, short, period in (
+        ("five_hour", "5-hour", "5h", 18000),
+        ("seven_day", "Weekly", "1w", 604800),
+        ("seven_day_opus", "Opus weekly", "Opus", 604800),
+        ("seven_day_sonnet", "Sonnet weekly", "Sonnet", 604800),
+    ):
+        item = data.get(key)
+        if not isinstance(item, dict):
+            continue
+        used = number(item.get("utilization"))
+        if used is None:
+            continue
+        provider.windows.append(
+            Window(key, label, short, clamp(used), epoch(item.get("resets_at")), period)
+        )
+
+    limits = data.get("limits")
+    if isinstance(limits, list):
+        for item in limits:
+            if not isinstance(item, dict) or item.get("kind") != "weekly_scoped":
+                continue
+            percent = number(item.get("percent"))
+            scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
+            model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+            name = model.get("display_name")
+            if percent is None or not isinstance(name, str):
+                continue
+            provider.windows.append(
+                Window(f"scoped:{name}", f"{name} weekly", name, clamp(percent), epoch(item.get("resets_at")), 604800, False)
+            )
+
+    if include_extras:
+        provider.resets = _claude_reset_credits(data)
+        provider.subscription = _claude_subscription(access)
+
+    if not provider.windows:
+        provider.status = "error"
+        provider.error = "no quota windows in response"
+    return provider
+
+
+def _claude_fetch_snapshot(oauth: dict[str, Any], account_id: str) -> Provider:
+    """Fetch quota preview for an inactive Claude vault snapshot."""
+    provider = Provider("claude", "Claude")
+    if not isinstance(oauth, dict) or not (oauth.get("accessToken") or oauth.get("refreshToken")):
+        provider.status = "not_configured"
+        return provider
+
+    access = oauth.get("accessToken") if isinstance(oauth.get("accessToken"), str) else ""
+    expires_ms = number(oauth.get("expiresAt"))
+    needs_refresh = not access or (expires_ms is not None and expires_ms / 1000 <= time.time() + 60)
+
+    def _refresh_inactive() -> Optional[dict[str, Any]]:
+        refresh_token = oauth.get("refreshToken")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            return None
+        client_id = oauth.get("clientId")
+        if not isinstance(client_id, str) or not client_id:
+            client_id = CLAUDE_CLIENT_ID
+        body: dict[str, Any] = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+        }
+        scopes = oauth.get("scopes")
+        if isinstance(scopes, list) and scopes:
+            scope_str = " ".join(s for s in scopes if isinstance(s, str) and s)
+            if scope_str:
+                body["scope"] = scope_str
+        st, resp = post_json(CLAUDE_TOKEN_URL, body, {"User-Agent": CLAUDE_USER_AGENT})
+        if st != 200 or not isinstance(resp, dict) or not isinstance(resp.get("access_token"), str):
+            return None
+        now_s = time.time()
+        updated: dict[str, Any] = {
+            "accessToken": resp["access_token"],
+            "refreshToken": resp.get("refresh_token") if isinstance(resp.get("refresh_token"), str) and resp.get("refresh_token") else refresh_token,
+        }
+        exp_in = number(resp.get("expires_in"))
+        if exp_in is not None and exp_in > 0:
+            updated["expiresAt"] = int((now_s + exp_in) * 1000)
+        rexp_in = number(resp.get("refresh_token_expires_in"))
+        if rexp_in is not None and rexp_in > 0:
+            updated["refreshTokenExpiresAt"] = int((now_s + rexp_in) * 1000)
+        granted = resp.get("scope")
+        if isinstance(granted, str) and granted.strip():
+            updated["scopes"] = granted.split()
+        mod = _load_accounts_module()
+        if mod is not None:
+            mod.update_vault_claude_oauth(account_id, updated)
+        merged = dict(oauth)
+        merged.update(updated)
+        return merged
+
+    if needs_refresh:
+        refreshed = _refresh_inactive()
+        if refreshed and isinstance(refreshed.get("accessToken"), str):
+            oauth = refreshed
+            access = refreshed["accessToken"]
+        else:
+            provider.status = "expired"
+            return provider
+
+    status, data = _claude_fetch_usage(access)
+    if status in (401, 403):
+        refreshed = _refresh_inactive()
+        if refreshed and isinstance(refreshed.get("accessToken"), str):
+            oauth = refreshed
+            access = refreshed["accessToken"]
+            status, data = _claude_fetch_usage(access)
+
+    if status in (401, 403):
+        provider.status = "expired"
+        return provider
+    if status == 429:
+        provider.status = "error"
+        provider.error = "rate limited (429)"
+        return provider
+    if status != 200 or not isinstance(data, dict):
+        provider.status = "error"
+        provider.error = f"HTTP {status}" if status else "unreachable"
+        return provider
+    return _claude_populate_provider(provider, oauth, data, access, include_extras=False)
+
+
 def fetch_claude() -> Provider:
     provider = Provider("claude", "Claude")
     config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (HOME / ".claude"))
@@ -794,51 +948,7 @@ def fetch_claude() -> Provider:
         provider.error = f"HTTP {status}" if status else "unreachable"
         return provider
 
-    scopes = oauth.get("scopes")
-    if isinstance(scopes, list) and "user:profile" not in scopes:
-        provider.hint = "Token lacks the user:profile scope; re-login with `claude`."
-    plan = oauth.get("subscriptionType")
-    if isinstance(plan, str):
-        provider.plan = plan.capitalize()
-
-    for key, label, short, period in (
-        ("five_hour", "5-hour", "5h", 18000),
-        ("seven_day", "Weekly", "1w", 604800),
-        ("seven_day_opus", "Opus weekly", "Opus", 604800),
-        ("seven_day_sonnet", "Sonnet weekly", "Sonnet", 604800),
-    ):
-        item = data.get(key)
-        if not isinstance(item, dict):
-            continue
-        used = number(item.get("utilization"))
-        if used is None:
-            continue
-        provider.windows.append(
-            Window(key, label, short, clamp(used), epoch(item.get("resets_at")), period)
-        )
-
-    limits = data.get("limits")
-    if isinstance(limits, list):
-        for item in limits:
-            if not isinstance(item, dict) or item.get("kind") != "weekly_scoped":
-                continue
-            percent = number(item.get("percent"))
-            scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
-            model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
-            name = model.get("display_name")
-            if percent is None or not isinstance(name, str):
-                continue
-            provider.windows.append(
-                Window(f"scoped:{name}", f"{name} weekly", name, clamp(percent), epoch(item.get("resets_at")), 604800, False)
-            )
-
-    provider.resets = _claude_reset_credits(data)
-    provider.subscription = _claude_subscription(access)
-
-    if not provider.windows:
-        provider.status = "error"
-        provider.error = "no quota windows in response"
-    return provider
+    return _claude_populate_provider(provider, oauth, data, access, include_extras=True)
 
 
 # ---------------------------------------------------------------------------
@@ -925,8 +1035,7 @@ def _antigravity_clients() -> list[tuple[str, str]]:
     return pairs
 
 
-def _antigravity_credentials() -> tuple[Optional[str], Optional[str], Optional[int]]:
-    raw = secret_lookup("gemini", "antigravity")
+def _antigravity_parse_raw(raw: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[int]]:
     if not raw:
         return None, None, None
     text = raw.strip()
@@ -953,9 +1062,13 @@ def _antigravity_credentials() -> tuple[Optional[str], Optional[str], Optional[i
     return (access or None), (refresh or None), expiry
 
 
-def _antigravity_cached_token() -> Optional[str]:
+def _antigravity_credentials() -> tuple[Optional[str], Optional[str], Optional[int]]:
+    return _antigravity_parse_raw(secret_lookup("gemini", "antigravity"))
+
+
+def _antigravity_cached_token(cache_path: Path = ANTIGRAVITY_CACHE) -> Optional[str]:
     """Use the cached access token when possible; saves a secret-tool spawn."""
-    doc = load_json(ANTIGRAVITY_CACHE)
+    doc = load_json(cache_path)
     if not isinstance(doc, dict):
         return None
     access = doc.get("access_token")
@@ -967,7 +1080,7 @@ def _antigravity_cached_token() -> Optional[str]:
     return access
 
 
-def _antigravity_store(access: str, expires_in: float, refresh: str) -> None:
+def _antigravity_store(access: str, expires_in: float, refresh: str, cache_path: Path = ANTIGRAVITY_CACHE) -> None:
     try:
         CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
         payload = {
@@ -977,17 +1090,17 @@ def _antigravity_store(access: str, expires_in: float, refresh: str) -> None:
             ).isoformat(),
             "refresh_fingerprint": hashlib.sha256(refresh.encode()).hexdigest(),
         }
-        tmp = ANTIGRAVITY_CACHE.with_suffix(f".{os.getpid()}.tmp")
+        tmp = cache_path.with_suffix(f".{os.getpid()}.tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as fh:
             json.dump(payload, fh, separators=(",", ":"))
-        os.replace(tmp, ANTIGRAVITY_CACHE)
-        os.chmod(ANTIGRAVITY_CACHE, 0o600)
+        os.replace(tmp, cache_path)
+        os.chmod(cache_path, 0o600)
     except OSError:
         pass
 
 
-def _antigravity_refresh(refresh: str) -> Optional[str]:
+def _antigravity_refresh(refresh: str, cache_path: Path = ANTIGRAVITY_CACHE) -> Optional[str]:
     for client_id, client_secret in _antigravity_clients():
         status, data = post_form(
             "https://oauth2.googleapis.com/token",
@@ -1001,17 +1114,17 @@ def _antigravity_refresh(refresh: str) -> Optional[str]:
         if status == 200 and isinstance(data, dict):
             access = data.get("access_token")
             if isinstance(access, str) and access:
-                _antigravity_store(access, number(data.get("expires_in")) or 3600, refresh)
+                _antigravity_store(access, number(data.get("expires_in")) or 3600, refresh, cache_path=cache_path)
                 return access
         if status == 0:
             break
     return None
 
 
-def _antigravity_reauth() -> Optional[str]:
-    access, refresh, expiry = _antigravity_credentials()
+def _antigravity_reauth(raw_override: Optional[str] = None, cache_path: Path = ANTIGRAVITY_CACHE) -> Optional[str]:
+    access, refresh, expiry = _antigravity_parse_raw(raw_override) if raw_override is not None else _antigravity_credentials()
     if refresh:
-        return _antigravity_refresh(refresh)
+        return _antigravity_refresh(refresh, cache_path=cache_path)
     if access and (expiry is None or expiry > time.time() + 60):
         return access
     return None
@@ -1136,18 +1249,18 @@ def _antigravity_models(access: str) -> tuple[int, list[dict[str, Any]]]:
     return status, result
 
 
-def fetch_antigravity() -> Provider:
+def _fetch_antigravity_impl(raw_override: Optional[str] = None, cache_path: Path = ANTIGRAVITY_CACHE) -> Provider:
     provider = Provider("antigravity", "Antigravity")
 
-    access = _antigravity_cached_token()
+    access = _antigravity_cached_token(cache_path)
     if not access:
-        access, refresh, expiry = _antigravity_credentials()
+        access, refresh, expiry = _antigravity_parse_raw(raw_override) if raw_override is not None else _antigravity_credentials()
         if not access and not refresh:
             provider.status = "not_configured"
             provider.hint = "Sign in through the Antigravity IDE."
             return provider
         if refresh and (not access or (expiry is not None and expiry <= time.time() + 60)):
-            access = _antigravity_refresh(refresh)
+            access = _antigravity_refresh(refresh, cache_path=cache_path)
 
     if not access:
         provider.status = "expired"
@@ -1156,7 +1269,7 @@ def fetch_antigravity() -> Provider:
 
     status, data = _antigravity_quota(access)
     if status in (401, 403):
-        access = _antigravity_reauth()
+        access = _antigravity_reauth(raw_override=raw_override, cache_path=cache_path)
         if not access:
             provider.status = "expired"
             provider.hint = "Antigravity session expired — sign in again."
@@ -1179,7 +1292,7 @@ def fetch_antigravity() -> Provider:
     if gemini_5h is None or claude_5h is None:
         model_status, models = _antigravity_models(access)
         if model_status in (401, 403):
-            renewed = _antigravity_reauth()
+            renewed = _antigravity_reauth(raw_override=raw_override, cache_path=cache_path)
             if renewed:
                 access = renewed
                 model_status, models = _antigravity_models(access)
@@ -1218,6 +1331,10 @@ def fetch_antigravity() -> Provider:
         provider.status = "error"
         provider.error = "no quota windows in response"
     return provider
+
+
+def fetch_antigravity() -> Provider:
+    return _fetch_antigravity_impl()
 
 
 # ---------------------------------------------------------------------------
@@ -1274,9 +1391,8 @@ def _opencode_key() -> Optional[str]:
     return None
 
 
-def fetch_opencodego() -> Provider:
+def _opencodego_fetch_with_key(key: Optional[str]) -> Provider:
     provider = Provider("opencodego", "OpenCode Go")
-    key = _opencode_key()
     if not key:
         provider.status = "not_configured"
         provider.hint = "Run `opencode auth login -p opencode-go`."
@@ -1353,14 +1469,17 @@ def fetch_opencodego() -> Provider:
     return provider
 
 
+def fetch_opencodego() -> Provider:
+    return _opencodego_fetch_with_key(_opencode_key())
+
+
 # ---------------------------------------------------------------------------
 # Grok (xAI CLI)
 # ---------------------------------------------------------------------------
 
 
-def fetch_grok() -> Provider:
+def _grok_fetch_with_auth(auth: Any) -> Provider:
     provider = Provider("grok", "Grok")
-    auth = load_json(HOME / ".grok" / "auth.json")
     if not isinstance(auth, dict):
         provider.status = "not_configured"
         provider.hint = "Sign in with `grok login`."
@@ -1419,6 +1538,10 @@ def fetch_grok() -> Provider:
         provider.status = "error"
         provider.error = "no quota windows in response"
     return provider
+
+
+def fetch_grok() -> Provider:
+    return _grok_fetch_with_auth(load_json(HOME / ".grok" / "auth.json"))
 
 
 # ---------------------------------------------------------------------------
@@ -1556,9 +1679,8 @@ def _muse_token() -> Optional[str]:
     return None
 
 
-def fetch_muse() -> Provider:
+def _muse_fetch_with_token(token: Optional[str]) -> Provider:
     provider = Provider("muse", "Muse Code")
-    token = _muse_token()
     if not token:
         provider.status = "not_configured"
         provider.hint = "Sign in with `muse login`."
@@ -1624,6 +1746,10 @@ def fetch_muse() -> Provider:
     if not provider.windows:
         provider.hint = "Quota omitted while the 5-hour window is idle."
     return provider
+
+
+def fetch_muse() -> Provider:
+    return _muse_fetch_with_token(_muse_token())
 
 
 # ---------------------------------------------------------------------------
@@ -1698,15 +1824,14 @@ def _kimi_headers(token: str, kind: str) -> dict[str, str]:
     return headers
 
 
-def fetch_kimi() -> Provider:
+def _kimi_fetch_with_settings(token: Optional[str], kind: str, region: str) -> Provider:
     provider = Provider("kimi", "Kimi Code")
-    token, kind, region = _kimi_settings()
     if not token:
         provider.status = "not_configured"
         provider.hint = "Set KIMI_CODE_API_KEY or run `kimi` to sign in."
         return provider
 
-    status, data = http("GET", KIMI_ENDPOINTS[region], _kimi_headers(token, kind))
+    status, data = http("GET", KIMI_ENDPOINTS.get(region, KIMI_ENDPOINTS["china"]), _kimi_headers(token, kind))
     if status in (401, 403):
         provider.status = "expired"
         provider.hint = "Kimi rejected this credential — run `kimi` or update KIMI_CODE_API_KEY."
@@ -1782,6 +1907,11 @@ def fetch_kimi() -> Provider:
         provider.status = "error"
         provider.error = "no quota windows in response"
     return provider
+
+
+def fetch_kimi() -> Provider:
+    token, kind, region = _kimi_settings()
+    return _kimi_fetch_with_settings(token, kind, region)
 
 
 # ---------------------------------------------------------------------------
@@ -1895,9 +2025,14 @@ def _qwen_parse_rate_headers(headers: dict[str, str]) -> list[Window]:
     return windows
 
 
-def fetch_qwen() -> Provider:
+def _qwen_fetch_with_creds(
+    token: Optional[str],
+    kind: str,
+    region: str,
+    expires_at: Optional[int],
+    resource_url: Optional[str],
+) -> Provider:
     provider = Provider("qwen", "Qwen")
-    token, kind, region, expires_at, resource_url = _qwen_credentials()
     if not token:
         provider.status = "not_configured"
         provider.hint = "Sign in with `qwen` or set QWEN_CODING_API_KEY / DASHSCOPE_API_KEY."
@@ -1917,10 +2052,10 @@ def fetch_qwen() -> Provider:
         url = f"https://{host}/v1/models"
         provider.plan = "OAuth"
     elif kind == "coding_plan":
-        url = QWEN_CODING_ENDPOINTS[region]
+        url = QWEN_CODING_ENDPOINTS.get(region, QWEN_CODING_ENDPOINTS["international"])
         provider.plan = "Coding Plan"
     else:
-        url = QWEN_API_ENDPOINTS[region]
+        url = QWEN_API_ENDPOINTS.get(region, QWEN_API_ENDPOINTS["international"])
         provider.plan = "API"
 
     status, data, resp_headers = http_with_headers(
@@ -1945,6 +2080,11 @@ def fetch_qwen() -> Provider:
     if not provider.windows:
         provider.hint = "Connected (Qwen does not expose quota counters on this endpoint)."
     return provider
+
+
+def fetch_qwen() -> Provider:
+    token, kind, region, expires_at, resource_url = _qwen_credentials()
+    return _qwen_fetch_with_creds(token, kind, region, expires_at, resource_url)
 
 
 # ---------------------------------------------------------------------------
@@ -1984,9 +2124,170 @@ def save_cache(payload: dict[str, Any]) -> None:
         pass
 
 
+_ACCOUNTS_MOD: Any = None
+_ACCOUNTS_MOD_LOADED = False
+
+
+def _load_accounts_module() -> Any:
+    global _ACCOUNTS_MOD, _ACCOUNTS_MOD_LOADED
+    if _ACCOUNTS_MOD_LOADED:
+        return _ACCOUNTS_MOD
+    _ACCOUNTS_MOD_LOADED = True
+    try:
+        code_dir = str(Path(__file__).resolve().parent)
+        if code_dir not in sys.path:
+            sys.path.insert(0, code_dir)
+        import oasis_accounts as mod  # type: ignore[import-not-found]
+        _ACCOUNTS_MOD = mod
+    except Exception:
+        _ACCOUNTS_MOD = None
+    return _ACCOUNTS_MOD
+
+
+def _fetch_account_preview(provider_id: str, account: dict[str, Any]) -> Provider:
+    """Fetch live usage windows for an inactive saved account."""
+    aid = str(account.get("id") or "")
+    if provider_id == "opencodego":
+        return _opencodego_fetch_with_key(account.get("_key"))
+
+    snap = account.get("_secret")
+    if not isinstance(snap, dict):
+        p = Provider(provider_id, provider_id.title())
+        p.status = "not_configured"
+        return p
+
+    if provider_id == "codex":
+        auth = snap.get("auth") if isinstance(snap.get("auth"), dict) else snap
+        tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
+        token = tokens.get("access_token") or ""
+        acct = tokens.get("account_id") or ""
+        plan = auth.get("plan_type") if isinstance(auth.get("plan_type"), str) else None
+        return _codex_fetch_with_token(token, acct, plan, include_extras=False)
+
+    if provider_id == "claude":
+        oauth = snap.get("claudeAiOauth")
+        if not isinstance(oauth, dict):
+            p = Provider("claude", "Claude")
+            p.status = "not_configured"
+            return p
+        return _claude_fetch_snapshot(oauth, aid)
+
+    if provider_id == "antigravity":
+        raw = snap.get("raw")
+        safe_id = "".join(ch for ch in aid if ch.isalnum() or ch in ("_", "-")) or "alt"
+        return _fetch_antigravity_impl(
+            raw_override=raw if isinstance(raw, str) else "",
+            cache_path=CACHE_DIR / f"antigravity_{safe_id}.json",
+        )
+
+    if provider_id == "qwen":
+        kind = snap.get("kind") or "oauth"
+        if kind == "api_key":
+            key = str(snap.get("api_key") or "").strip()
+            region = str(snap.get("region") or "international").lower()
+            qkind = "coding_plan" if key.startswith("sk-sp-") else "api"
+            return _qwen_fetch_with_creds(key or None, qkind, region, None, None)
+        oauth = snap.get("oauth") if isinstance(snap.get("oauth"), dict) else {}
+        access = oauth.get("access_token") or oauth.get("accessToken")
+        exp = epoch(oauth.get("expiry_date") or oauth.get("expires_at") or oauth.get("expiresAt"))
+        res_url = oauth.get("resource_url")
+        res_url = res_url.strip() if isinstance(res_url, str) and res_url.strip() else None
+        return _qwen_fetch_with_creds(
+            access.strip() if isinstance(access, str) and access.strip() else None,
+            "oauth",
+            "international",
+            exp,
+            res_url,
+        )
+
+    if provider_id == "muse":
+        token: Optional[str] = None
+        auth = snap.get("auth") if isinstance(snap.get("auth"), dict) else {}
+        providers = auth.get("providers") if isinstance(auth.get("providers"), dict) else {}
+        meta = providers.get("meta") if isinstance(providers.get("meta"), dict) else {}
+        if isinstance(meta.get("access_token"), str) and meta["access_token"].strip():
+            token = meta["access_token"].strip()
+        elif isinstance(snap.get("keyring_raw"), str) and snap["keyring_raw"].strip():
+            raw = snap["keyring_raw"].strip()
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict) and isinstance(parsed.get("access_token"), str):
+                    token = parsed["access_token"].strip()
+                else:
+                    token = raw
+            except ValueError:
+                token = raw
+        return _muse_fetch_with_token(token)
+
+    if provider_id == "kimi":
+        kind = snap.get("kind") or "cli"
+        region = str(snap.get("region") or "china").lower()
+        if kind == "api_key":
+            key = str(snap.get("api_key") or "").strip()
+            return _kimi_fetch_with_settings(key or None, "api", region)
+        cli = snap.get("cli") if isinstance(snap.get("cli"), dict) else {}
+        access = cli.get("access_token")
+        expires = number(cli.get("expires_at"))
+        if isinstance(access, str) and access.strip() and (expires is None or expires > time.time() + 60):
+            return _kimi_fetch_with_settings(access.strip(), "cli", region)
+        p = Provider("kimi", "Kimi Code")
+        p.status = "expired"
+        return p
+
+    if provider_id == "grok":
+        auth = snap.get("auth") if isinstance(snap.get("auth"), dict) else snap
+        return _grok_fetch_with_auth(auth)
+
+    p = Provider(provider_id, provider_id.title())
+    p.status = "not_configured"
+    return p
+
+
+def _public_account_entry(raw_acc: dict[str, Any], preview: Optional[Provider], *, stale: bool = False) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "id": raw_acc.get("id"),
+        "label": raw_acc.get("label"),
+        "email": raw_acc.get("email"),
+        "active": bool(raw_acc.get("active")),
+        "source": raw_acc.get("source"),
+        "kind": raw_acc.get("kind"),
+        "region": raw_acc.get("region"),
+    }
+    if preview is not None:
+        entry["status"] = preview.status
+        entry["plan"] = preview.plan
+        entry["windows"] = [asdict(w) for w in preview.windows]
+        entry["error"] = preview.error
+        entry["stale"] = stale or preview.stale
+    return entry
+
+
 def run(selected: list[str]) -> dict[str, Any]:
-    with ThreadPoolExecutor(max_workers=len(selected) or 1) as pool:
+    accounts_mod = _load_accounts_module()
+    account_states: dict[str, dict[str, Any]] = {}
+    if accounts_mod is not None:
+        for key in selected:
+            try:
+                account_states[key] = accounts_mod.list_provider_accounts(key, include_secrets=True)
+            except Exception:
+                pass
+
+    inactive_jobs: list[tuple[str, dict[str, Any]]] = []
+    for key in selected:
+        state = account_states.get(key)
+        if not state or not state.get("supports_accounts"):
+            continue
+        for acc in state.get("accounts") or []:
+            if not acc.get("active"):
+                inactive_jobs.append((key, acc))
+
+    max_workers = min(16, max(1, len(selected) + len(inactive_jobs)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {key: pool.submit(FETCHERS[key]) for key in selected}
+        preview_futures = {
+            (pid, str(acc.get("id") or "")): pool.submit(_fetch_account_preview, pid, acc)
+            for pid, acc in inactive_jobs
+        }
         results = []
         for key in selected:
             try:
@@ -1997,6 +2298,16 @@ def run(selected: list[str]) -> dict[str, Any]:
                 failed.error = "helper failure"
                 results.append(failed)
 
+        preview_results: dict[tuple[str, str], Provider] = {}
+        for job_key, fut in preview_futures.items():
+            try:
+                preview_results[job_key] = fut.result()
+            except Exception:
+                failed = Provider(job_key[0], job_key[0].title())
+                failed.status = "error"
+                failed.error = "preview failure"
+                preview_results[job_key] = failed
+
     previous = load_cache()
     previous_providers = {
         item.get("id"): item
@@ -2004,20 +2315,84 @@ def run(selected: list[str]) -> dict[str, Any]:
         if isinstance(item, dict)
     }
     previous_ts = previous.get("ts")
+    previous_age = (time.time() - previous_ts) if isinstance(previous_ts, (int, float)) else 1e9
 
     payload: dict[str, Any] = {"version": 1, "ts": int(time.time()), "fetchedAt": now_iso(), "providers": []}
     for provider in results:
-        # Network failures fall back to the last good reading for 24h.
-        if provider.status == "error" and isinstance(previous_ts, (int, float)):
-            cached = previous_providers.get(provider.id)
-            age = time.time() - previous_ts
-            if cached and cached.get("status") == "ok" and age < 86400:
-                restored = dict(cached)
-                restored["stale"] = True
-                restored["error"] = provider.error
-                payload["providers"].append(restored)
-                continue
-        payload["providers"].append(asdict(provider))
+        state = account_states.get(provider.id)
+        if state and state.get("supports_accounts"):
+            provider.supports_accounts = True
+            provider.account = state.get("active_label")
+            provider.account_id = state.get("active_id")
+
+        cached = previous_providers.get(provider.id)
+        cached_accounts_by_id = {
+            str(a.get("id") or ""): a
+            for a in (cached.get("accounts") if isinstance(cached, dict) and isinstance(cached.get("accounts"), list) else [])
+            if isinstance(a, dict)
+        }
+
+        # Network failures fall back to the last good reading for 24h (only for the same account).
+        provider_dict: dict[str, Any]
+        if (
+            provider.status == "error"
+            and cached
+            and cached.get("status") == "ok"
+            and previous_age < 86400
+            and cached.get("account_id") == provider.account_id
+        ):
+            provider_dict = dict(cached)
+            provider_dict["stale"] = True
+            provider_dict["error"] = provider.error
+            provider_dict["supports_accounts"] = provider.supports_accounts
+            provider_dict["account"] = provider.account
+            provider_dict["account_id"] = provider.account_id
+        else:
+            provider_dict = asdict(provider)
+
+        # Build enriched accounts list (active + live/cached previews for inactive accounts).
+        if state and state.get("supports_accounts"):
+            public_accounts: list[dict[str, Any]] = []
+            for raw_acc in state.get("accounts") or []:
+                aid = str(raw_acc.get("id") or "")
+                if raw_acc.get("active"):
+                    entry = _public_account_entry(raw_acc, None)
+                    entry["status"] = provider_dict.get("status")
+                    entry["plan"] = provider_dict.get("plan")
+                    entry["windows"] = provider_dict.get("windows") or []
+                    entry["error"] = provider_dict.get("error")
+                    entry["stale"] = bool(provider_dict.get("stale"))
+                    public_accounts.append(entry)
+                else:
+                    prev_p = preview_results.get((provider.id, aid))
+                    cached_acc = cached_accounts_by_id.get(aid)
+                    if (
+                        prev_p is not None
+                        and prev_p.status == "error"
+                        and cached_acc
+                        and cached_acc.get("status") == "ok"
+                        and previous_age < 86400
+                    ):
+                        entry = _public_account_entry(raw_acc, None)
+                        entry["status"] = "ok"
+                        entry["plan"] = cached_acc.get("plan")
+                        entry["windows"] = cached_acc.get("windows") or []
+                        entry["error"] = prev_p.error
+                        entry["stale"] = True
+                        public_accounts.append(entry)
+                    else:
+                        public_accounts.append(_public_account_entry(raw_acc, prev_p))
+
+            provider_dict["accounts"] = public_accounts
+            provider_dict["account_capabilities"] = {
+                "supports_login": bool(state.get("supports_login")),
+                "supports_api_key": bool(state.get("supports_api_key")),
+                "api_key_placeholder": state.get("api_key_placeholder") or "",
+                "regions": state.get("regions") or [],
+                "login_hint": state.get("login_hint") or "",
+            }
+
+        payload["providers"].append(provider_dict)
 
     save_cache(payload)
     return payload

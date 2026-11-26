@@ -16,7 +16,7 @@ jobs:
 
       - name: Validate Python helpers
         run: |
-          python3 -m py_compile package/contents/code/ai_limits.py package/contents/code/oasisctl.py package/contents/code/oasis_intel.py
+          python3 -m py_compile package/contents/code/ai_limits.py package/contents/code/oasis_accounts.py package/contents/code/oasisctl.py package/contents/code/oasis_intel.py
 
       - name: Build .plasmoid archive
         run: |
