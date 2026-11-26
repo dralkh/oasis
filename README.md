@@ -36,9 +36,21 @@ The top-right corner of the popup has a small **×** to quit, and the tray
 context menu has **Quit Oasis**. Quitting removes the applet from the panel;
 search **Oasis** in the application launcher to put it back in the system tray.
 
-![panel](docs/panel.png)
+## Previews
 
-![popup](docs/popup.png)
+<p align="center">
+  <img src="docs/panel.png" alt="Oasis KDE Plasma vertical and horizontal panel widgets" width="760">
+</p>
+
+| Usage Limits & Inline Account Switcher | Multi-Account Manager (`⇄ Accounts`) |
+| :---: | :---: |
+| <img src="docs/popup.png" alt="Oasis main popup showing usage bars, account pills, and reset credits" width="430"> | <img src="docs/accounts.png" alt="Oasis multi-account manager with live quota previews" width="430"> |
+
+| Integrated Oasis Proxy & Single-Daemon Tier Routing | AI Intel & Capability vs. Cost Pareto Graph (`✦ Intel`) |
+| :---: | :---: |
+| <img src="docs/proxy.png" alt="Oasis Proxy panel with model catalog, thinking modes, account pinning, and tier routing" width="430"> | <img src="docs/intel.png" alt="Oasis AI Intel modal with Pareto frontier chart and Diamond/Gold/Silver tiers" width="430"> |
+
+*(All screenshots above use seeded demo data — no real accounts or credentials.)*
 
 ## Provider coverage
 
@@ -180,7 +192,7 @@ Kimi Code, Grok**), updating each CLI's active credential store directly:
   syncs the live credential back to its vault snapshot so CLI-rotated refresh
   tokens are never lost.
 
-## Integrated local inference proxy (`⚡ Proxy`)
+## Integrated local inference proxy (`Proxy`)
 
 Oasis supports two independent operating modes:
 
@@ -234,7 +246,7 @@ Configured thinking/reasoning effort (`auto`, `none`, `low`, `medium`, `high`, `
 
 ### Connecting coding agents & SDKs to Oasis Proxy
 
-Click **Copy URL** and **Copy Key** in the `⚡ Proxy` view (keys copy directly
+Click **Copy URL** and **Copy Key** in the **Proxy** view (keys copy directly
 via `wl-copy`/`xclip`/`xsel` stdin and never appear in UI properties or logs),
 or run `python3 package/contents/code/oasis_proxy.py client-configs`:
 
@@ -321,28 +333,6 @@ re-arms. Toggle it under **Notifications** in the widget settings.
 
 See [SECURITY.md](SECURITY.md) for the full data-flow table, threat model and
 audit commands.
-
-## Why this instead of the five existing widgets
-
-Static review on 2026-10-29 (none of the install scripts or binaries were run):
-
-| Repository | Stack | Providers | Main trust issue |
-|---|---|---|---|
-| `EvilFreelancer/CodexBar-KDE` | QML + JS | via CodexBar CLI | Command line built by concatenation; `codexbarPath` and provider IDs are unquoted (the proxy URL is quoted). Delegates all credentials to the upstream Swift CLI |
-| `tylxr59/KodexBar` | QML | via CodexBar CLI | Best UI/provider coverage (incl. OpenCode Go), but the actual credential access is the 99 MB, macOS-first CodexBar CLI installed from a brew tap or release tarball |
-| `yusufipk/kde-agents-usage` | Python stdlib | Claude, Codex | Only 2 providers; refreshes and rewrites rotating Codex tokens (can log out a running CLI) |
-| `burakgon/ai-usage-kde-widget` | Python stdlib | 7 (no OpenCode Go) | Closest existing fit and clean code, but installs with `pip --user --break-system-packages`, refreshes/writes Claude/Codex/Cursor credentials, and the compact view is single-provider |
-| `materemias/codexbar-agentview` | Python + C++ + Luau | via CodexBar CLI | Native C++ plugin plus CodexBar CLI; largest unauditable surface; macOS/Tern oriented |
-
-No repository showed telemetry or a non-first-party endpoint in a quick pass.
-The differentiator is **how much credential-holding code you trust**: three of
-the five import the entire CodexBar CLI, and two of the Python widgets rotate
-your tokens. This project keeps the credential surface to eight small parsers
-and never refreshes rotating tokens.
-
-Endpoint/parser knowledge was cross-checked against the MIT-licensed
-`burakgon/ai-usage-kde-widget`, CodexBar's provider docs, and OpenCode's public
-usage shapes. The code here is original.
 
 ## Verification
 

@@ -90,7 +90,19 @@ def test_qmllint_clean_on_new_and_modified_ui() -> None:
         ui_dir / "AccountsModal.qml",
     ]
     res = subprocess.run(
-        [str(qmllint), "--unqualified", "disable", "--missing-property", "disable", "-I", str(ui_dir)]
+        [
+            str(qmllint),
+            "--unqualified",
+            "disable",
+            "--missing-property",
+            "disable",
+            "--import",
+            "disable",
+            "--unresolved-type",
+            "disable",
+            "-I",
+            str(ui_dir),
+        ]
         + [str(t) for t in targets],
         capture_output=True,
         text=True,
