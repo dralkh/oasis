@@ -18,11 +18,11 @@ ColumnLayout {
     signal manageAccountsRequested(string providerId)
 
     readonly property var meta: F.meta(provider ? provider.id : "")
-    readonly property bool ok: provider
+    readonly property bool ok: !!(provider
         && provider.status === "ok"
         && provider.windows
-        && provider.windows.length > 0
-    readonly property bool antigravity: provider && provider.id === "antigravity"
+        && provider.windows.length > 0)
+    readonly property bool antigravity: !!(provider && provider.id === "antigravity")
     readonly property bool hasAccountSupport: !!(provider && provider.supports_accounts)
     readonly property var accountsList: provider && provider.accounts ? provider.accounts : []
     readonly property string activeAccountLabel: provider && provider.account ? String(provider.account) : ""

@@ -441,10 +441,12 @@ def test_real_backend_lifecycle_auth_contracts_and_concurrency(proxy_mod: Any) -
         assert _http_req("GET", f"{base}/v1/models")[0] == 401
         assert _http_req("GET", f"{base}/v1/models", headers={"Authorization": f"Bearer {mgmt_key}"})[0] == 401
 
-        # --- Contract 1: GET /v1/models (includes virtual oasis/* tier & provider models) ---
+        # --- Contract 1: GET /v1/models (includes oasis/auto + virtual oasis/* tier & provider models) ---
         st, body, _ = _http_req("GET", f"{base}/v1/models", headers={"Authorization": f"Bearer {client_key}"})
         assert st == 200
-        model_ids = {m["id"] for m in json.loads(body)["data"]}
+        model_list = [m["id"] for m in json.loads(body)["data"]]
+        model_ids = set(model_list)
+        assert model_list[0] == "oasis/auto"
         assert "mock-chat-model" in model_ids
         assert "claude-sonnet-5-5" in model_ids
         assert "gpt-6-astra" in model_ids
@@ -452,6 +454,27 @@ def test_real_backend_lifecycle_auth_contracts_and_concurrency(proxy_mod: Any) -
         assert "oasis/gold" in model_ids
         assert "oasis/silver" in model_ids
         assert "oasis/claude" in model_ids
+
+        # --- Contract 1a: Built-in `oasis/auto` and `oasis` alias auto-route across connected models ---
+        seen_upstream_payloads.clear()
+        st_auto, body_auto, _ = _http_req(
+            "POST",
+            f"{base}/v1/messages",
+            headers={"x-api-key": client_key, "anthropic-version": "2023-06-01"},
+            body={"model": "oasis/auto", "max_tokens": 128, "messages": [{"role": "user", "content": "auto test"}]},
+        )
+        assert st_auto == 200, body_auto
+        assert seen_upstream_payloads[-1]["body"]["model"] == "claude-sonnet-5-5"
+
+        seen_upstream_payloads.clear()
+        st_alias, body_alias, _ = _http_req(
+            "POST",
+            f"{base}/v1/messages",
+            headers={"x-api-key": client_key, "anthropic-version": "2023-06-01"},
+            body={"model": "oasis", "max_tokens": 128, "messages": [{"role": "user", "content": "alias test"}]},
+        )
+        assert st_alias == 200, body_alias
+        assert seen_upstream_payloads[-1]["body"]["model"] == "claude-sonnet-5-5"
 
         # --- Contract 1b: Tier endpoints (/tier/{tier}/*) + Thinking injection ---
         st_tm, body_tm, _ = _http_req("GET", f"{base}/tier/diamond/v1/models", headers={"Authorization": f"Bearer {client_key}"})

@@ -440,17 +440,20 @@ async fn tier_gemini(
 async fn models(State(app): State<Arc<App>>) -> Response {
     let created = app.started.timestamp();
     let cfg = app.cfg();
-    let mut data: Vec<Value> = app
-        .pool
-        .models()
-        .into_iter()
-        .map(|(id, provider)| {
-            json!({
-                "id": id, "object": "model", "created": created, "owned_by": provider.as_str(),
-                "type": "model", "display_name": id, "created_at": app.started.to_rfc3339(),
-            })
-        })
-        .collect();
+    let live = app.pool.models();
+    let mut data: Vec<Value> = Vec::with_capacity(live.len() + cfg.tiers.len() + cfg.provider_defaults.len() + 1);
+    if !live.is_empty() {
+        data.push(json!({
+            "id": "oasis/auto", "object": "model", "created": created, "owned_by": "oasis-auto",
+            "type": "model", "display_name": "Oasis Auto (cycles connected models)", "created_at": app.started.to_rfc3339(),
+        }));
+    }
+    for (id, provider) in live {
+        data.push(json!({
+            "id": id, "object": "model", "created": created, "owned_by": provider.as_str(),
+            "type": "model", "display_name": id, "created_at": app.started.to_rfc3339(),
+        }));
+    }
     for (tier, targets) in &cfg.tiers {
         if !targets.is_empty() {
             let id = format!("oasis/{tier}");
@@ -479,6 +482,22 @@ async fn tier_models(State(app): State<Arc<App>>, Path(tier): Path<String>) -> R
     let created = app.started.timestamp();
     let cfg = app.cfg();
     let key = tier.trim().to_ascii_lowercase();
+    if key == "auto" {
+        let mut data: Vec<Value> = vec![json!({
+            "id": "oasis/auto", "object": "model", "created": created, "owned_by": "oasis-auto",
+            "type": "model", "display_name": "Oasis Auto (cycles connected models)", "created_at": app.started.to_rfc3339(),
+        })];
+        for (id, provider) in app.pool.models() {
+            data.push(json!({
+                "id": id, "object": "model", "created": created, "owned_by": provider.as_str(),
+                "type": "model", "display_name": id, "created_at": app.started.to_rfc3339(),
+            }));
+        }
+        let first = data.first().and_then(|m| m["id"].as_str()).map(String::from);
+        let last = data.last().and_then(|m| m["id"].as_str()).map(String::from);
+        return axum::Json(json!({ "object": "list", "data": data, "has_more": false, "first_id": first, "last_id": last }))
+            .into_response();
+    }
     let Some(targets) = cfg.tiers.get(&key).filter(|v| !v.is_empty()) else {
         return (
             StatusCode::NOT_FOUND,

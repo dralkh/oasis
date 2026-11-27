@@ -33,11 +33,16 @@ ColumnLayout {
     signal providerDefaultChanged(string providerId, string model, string thinking)
     signal setTierRequested(string tier, string model, string thinking, bool clear)
     signal copyTierEndpointRequested(string tier)
+    signal copyAutoModelRequested()
+    signal autoSetupRequested()
+    signal syncCliAccountsRequested()
+    signal syncDetectedKeyRequested(string providerId)
     signal importIntelPreviewRequested()
     signal importIntelApplyRequested()
     signal clearIntelPreviewRequested()
 
     property string selectedProviderId: "codex"
+    property bool hasInitializedProvider: false
     property bool tiersExpanded: false
     property bool routingExpanded: false
     property bool statsExpanded: false
@@ -62,10 +67,11 @@ ColumnLayout {
     }
 
     onProxyStateChanged: {
-        if (proxyState && proxyState.policy && proxyState.policy.selected_provider) {
+        if (!hasInitializedProvider && proxyState && proxyState.policy && proxyState.policy.selected_provider) {
             var sp = String(proxyState.policy.selected_provider)
             if (providerOrder.indexOf(sp) !== -1) {
                 selectedProviderId = sp
+                hasInitializedProvider = true
             }
         }
     }
@@ -101,6 +107,7 @@ ColumnLayout {
         ? proxyState.totals
         : ({ requests: 0, ok: 0, failed: 0, input_tokens: 0, output_tokens: 0, cache_tokens: 0 })
     readonly property var allAccounts: proxyState && proxyState.accounts ? proxyState.accounts : []
+    readonly property var syncableStaticProviders: proxyState && proxyState.syncable_static_providers ? proxyState.syncable_static_providers : []
     readonly property var allModels: proxyState && proxyState.models ? proxyState.models : []
     readonly property var catalogModels: {
         if (proxyState && proxyState.catalog_models && proxyState.catalog_models.length > 0) {
@@ -490,7 +497,7 @@ ColumnLayout {
                             font.pixelSize: 9
                             Accessible.name: "Copy Oasis Proxy endpoint URL"
                             onClicked: panel.copyEndpointRequested()
-                            QQC2.ToolTip.text: (panel.proxyState ? panel.proxyState.openai_base_url : "http://127.0.0.1:8317/v1")
+                            QQC2.ToolTip.text: (panel.proxyState && panel.proxyState.openai_base_url ? String(panel.proxyState.openai_base_url) : "http://127.0.0.1:8317/v1")
                             QQC2.ToolTip.visible: hovered
                             QQC2.ToolTip.delay: 400
                         }
@@ -507,6 +514,30 @@ ColumnLayout {
                         }
 
                         QQC2.ToolButton {
+                            visible: panel.isRunning && panel.allAccounts.length > 0
+                            enabled: !panel.busy
+                            text: "Copy oasis/auto"
+                            font.pixelSize: 9
+                            Accessible.name: "Copy oasis/auto model name"
+                            onClicked: panel.copyAutoModelRequested()
+                            QQC2.ToolTip.text: "Copies 'oasis/auto' — automatically picks best connected model & cycles on rate limits"
+                            QQC2.ToolTip.visible: hovered
+                            QQC2.ToolTip.delay: 400
+                        }
+
+                        QQC2.ToolButton {
+                            visible: panel.isActiveProcess
+                            enabled: !panel.busy
+                            text: "Sync Accounts"
+                            font.pixelSize: 9
+                            Accessible.name: "Sync existing signed-in CLI accounts into Oasis Proxy"
+                            onClicked: panel.syncCliAccountsRequested()
+                            QQC2.ToolTip.text: "Imports your already signed-in CLI accounts (Codex, Claude, OpenCode Go, etc.) into Oasis Proxy"
+                            QQC2.ToolTip.visible: hovered
+                            QQC2.ToolTip.delay: 400
+                        }
+
+                        QQC2.ToolButton {
                             visible: panel.isActiveProcess
                             enabled: !panel.busy && !!panel.backendInfo.compatible
                             text: "Restart"
@@ -514,6 +545,26 @@ ColumnLayout {
                             Accessible.name: "Restart Oasis Proxy"
                             onClicked: panel.restartRequested()
                         }
+                    }
+
+                    Text {
+                        visible: panel.isRunning && panel.allAccounts.length > 0
+                        Layout.fillWidth: true
+                        text: "Ready — point any client to Copy URL + Copy Key with model oasis/auto (" + panel.allAccounts.length
+                            + (panel.allAccounts.length === 1 ? " account, " : " accounts, ")
+                            + panel.allModels.length + " live models)."
+                        color: panel.mutedColor
+                        font.pixelSize: 8
+                        wrapMode: Text.WordWrap
+                    }
+
+                    Text {
+                        visible: panel.isRunning && panel.allAccounts.length === 0
+                        Layout.fillWidth: true
+                        text: "No signed-in CLI accounts detected yet. Sign into any CLI (or use Accounts), then click Sync Accounts."
+                        color: Kirigami.Theme.neutralTextColor
+                        font.pixelSize: 8
+                        wrapMode: Text.WordWrap
                     }
 
                     Text {
@@ -563,7 +614,7 @@ ColumnLayout {
                 }
             }
 
-            // Provider capabilities, model selection, thinking mode & proxy account pinning
+            // Provider capabilities, model selection, thinking mode & account pinning
             Rectangle {
                 Layout.fillWidth: true
                 radius: 6
@@ -613,13 +664,20 @@ ColumnLayout {
                                     ? Kirigami.Theme.highlightColor
                                     : (selected ? Qt.rgba(pColor.r, pColor.g, pColor.b, 0.55) : panel.cardBorder)
 
-                                Keys.onReturnPressed: if (!panel.busy) panel.selectedProviderId = modelData
-                                Keys.onSpacePressed: if (!panel.busy) panel.selectedProviderId = modelData
+                                Keys.onReturnPressed: if (!panel.busy) { panel.hasInitializedProvider = true; panel.selectedProviderId = modelData }
+                                Keys.onSpacePressed: if (!panel.busy) { panel.hasInitializedProvider = true; panel.selectedProviderId = modelData }
 
                                 RowLayout {
                                     id: pPillRow
                                     anchors.centerIn: parent
                                     spacing: 3
+                                    Rectangle {
+                                        visible: !!(panel.proxyState && panel.proxyState.connected_providers && panel.proxyState.connected_providers.indexOf(modelData) !== -1)
+                                        implicitWidth: 5
+                                        implicitHeight: 5
+                                        radius: 3
+                                        color: Kirigami.Theme.positiveTextColor
+                                    }
                                     Text {
                                         text: pMeta.short
                                         color: selected ? pColor : panel.mutedColor
@@ -636,7 +694,10 @@ ColumnLayout {
 
                                 TapHandler {
                                     enabled: !panel.busy
-                                    onTapped: panel.selectedProviderId = modelData
+                                    onTapped: {
+                                        panel.hasInitializedProvider = true
+                                        panel.selectedProviderId = modelData
+                                    }
                                 }
                             }
                         }
@@ -955,15 +1016,29 @@ ColumnLayout {
 
                     RowLayout {
                         Layout.fillWidth: true
-                        visible: panel.currentCap.proxy_support === "native" && !!panel.backendInfo.compatible
+                        visible: panel.currentCap.proxy_support !== "monitoring_only" && !!panel.backendInfo.compatible
                         spacing: 6
 
-                        QQC2.Button {
+                        QQC2.ToolButton {
                             enabled: !panel.busy
-                            text: "+ Add isolated " + panel.currentCap.name + " proxy account"
+                            text: "Sync " + panel.currentCap.name + " from CLI"
                             font.pixelSize: 9
-                            Accessible.name: "Add isolated " + panel.currentCap.name + " proxy account"
+                            Accessible.name: "Sync existing " + panel.currentCap.name + " CLI login into Oasis Proxy"
+                            onClicked: panel.syncCliAccountsRequested()
+                        }
+
+                        Item { Layout.fillWidth: true }
+
+                        QQC2.ToolButton {
+                            visible: panel.currentCap.proxy_support === "native"
+                            enabled: !panel.busy
+                            text: "+ Separate login"
+                            font.pixelSize: 9
+                            Accessible.name: "Add separate standalone " + panel.currentCap.name + " login"
                             onClicked: panel.launchProxyLoginRequested(panel.selectedProviderId)
+                            QQC2.ToolTip.text: "Optional: sign in with a completely separate browser session instead of reusing your CLI login"
+                            QQC2.ToolTip.visible: hovered
+                            QQC2.ToolTip.delay: 400
                         }
                     }
                 }
@@ -1022,16 +1097,39 @@ ColumnLayout {
                         Layout.fillWidth: true
                         spacing: 5
 
-                        RowLayout {
+                        // Clear plain-English routing legend so users always know what routes where
+                        Rectangle {
                             Layout.fillWidth: true
-                            spacing: 6
+                            radius: 4
+                            implicitHeight: guideTxt.implicitHeight + 8
+                            color: Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.04)
 
                             Text {
-                                Layout.fillWidth: true
-                                text: "One daemon serves model IDs (oasis/diamond) and tier URLs (/tier/diamond/v1) with shared OAuth pools."
+                                id: guideTxt
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.margins: 4
+                                text: "• oasis/auto (main URL): auto-picks best connected model & cycles on rate limits.\n• oasis/diamond · gold · silver · subagent (or /tier/<name>/v1): pin roles to specific models & thinking.\n• Exact model name: always uses that model while cycling its provider's accounts."
                                 color: panel.mutedColor
                                 font.pixelSize: 8
                                 wrapMode: Text.WordWrap
+                            }
+                        }
+
+                        Flow {
+                            Layout.fillWidth: true
+                            spacing: 5
+
+                            QQC2.Button {
+                                enabled: !panel.busy && (panel.allAccounts.length > 0 || panel.syncableStaticProviders.length > 0)
+                                text: "Auto-Setup All Tiers"
+                                font.pixelSize: 9
+                                Accessible.name: "Automatically configure all tiers from connected accounts"
+                                onClicked: panel.autoSetupRequested()
+                                QQC2.ToolTip.text: "Automatically configures Diamond, Gold, Silver & Subagent from your connected accounts (uses AI Intel if available)"
+                                QQC2.ToolTip.visible: hovered
+                                QQC2.ToolTip.delay: 400
                             }
 
                             QQC2.ToolButton {

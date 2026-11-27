@@ -1,6 +1,6 @@
 # Maintainer: dralk <https://github.com/dralkh>
 pkgname=plasma6-applets-oasis
-pkgver=1.4.0
+pkgver=1.5.0
 pkgrel=1
 pkgdesc="KDE Plasma 6 panel widget for AI coding CLI usage limits, live multi-account switching, integrated Oasis Proxy, reset credits & AI Intel"
 arch=('x86_64' 'aarch64')

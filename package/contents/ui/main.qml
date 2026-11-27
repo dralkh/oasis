@@ -24,6 +24,12 @@ PlasmoidItem {
     property string accountNotice: ""
     property string pendingAccountAction: ""
     property bool refreshQueued: false
+    property string watchAccountProvider: ""
+    property string watchAccountBaseline: ""
+    property int watchAccountTicks: 0
+    property string watchProxyProvider: ""
+    property int watchProxyBaselineCount: -1
+    property int watchProxyTicks: 0
     property var proxyState: null
     property var proxyIntelPreview: null
     property bool proxyBusy: false
@@ -94,6 +100,7 @@ PlasmoidItem {
         onAddApiKeyPromptRequested: function(p, l, r) { root.promptAddApiKeyAccount(p, l, r) }
         onRenameAccountRequested: function(p, a, l) { root.renameAccount(p, a, l) }
         onRemoveAccountRequested: function(p, a) { root.removeAccount(p, a) }
+        onAccountsSyncRequested: function(p) { root.syncProviderAccountsFast(p) }
         onClearAccountMessagesRequested: {
             root.accountError = ""
             root.accountNotice = ""
@@ -115,6 +122,10 @@ PlasmoidItem {
         onProxyProviderDefaultRequested: function(p, m, t) { root.setProxyProviderDefault(p, m, t) }
         onProxySetTierRequested: function(t, m, th, c) { root.setProxyTier(t, m, th, c) }
         onProxyCopyTierEndpointRequested: function(t) { root.copyProxyTierEndpoint(t) }
+        onProxyCopyAutoModelRequested: root.copyProxyAutoModel()
+        onProxyAutoSetupRequested: root.autoSetupProxy()
+        onProxySyncCliAccountsRequested: root.syncProxyCliAccounts()
+        onProxySyncDetectedKeyRequested: function(p) { root.syncDetectedProxyKey(p) }
         onProxyImportIntelPreviewRequested: root.previewProxyIntelImport()
         onProxyImportIntelApplyRequested: root.applyProxyIntelImport()
         onProxyClearIntelPreviewRequested: root.proxyIntelPreview = null
@@ -139,7 +150,7 @@ PlasmoidItem {
                     : "helper returned no data"
                 if (root.refreshQueued) {
                     root.refreshQueued = false
-                    root.refresh()
+                    Qt.callLater(root.refresh)
                 }
                 return
             }
@@ -159,7 +170,7 @@ PlasmoidItem {
             }
             if (root.refreshQueued) {
                 root.refreshQueued = false
-                root.refresh()
+                Qt.callLater(root.refresh)
             }
         }
     }
@@ -259,37 +270,119 @@ PlasmoidItem {
                 if (action === "switch") {
                     root.accountNotice = "Switched " + pName + " → " + lbl + " (CLI updated)"
                     root.clearLimitStateForProvider(doc.provider)
-                    root.refresh()
+                    if (doc.state) {
+                        root.applyProviderAccountState(doc.provider, doc.state)
+                    }
+                    Qt.callLater(root.refresh)
+                    root.syncProxyCliAccountsIfRunning()
                 } else if (action === "add-key") {
                     if (doc.launched) {
                         root.accountNotice = doc.message
-                            ? String(doc.message) + " Refresh once finished."
-                            : "Opened terminal to enter API key. Refresh once finished."
+                            ? String(doc.message) + " Oasis will update automatically."
+                            : "Opened terminal to enter API key — Oasis will update automatically."
+                        root.startAccountWatch(doc.provider)
                     } else {
                         root.accountNotice = "Added & activated " + pName + " → " + lbl
                         root.clearLimitStateForProvider(doc.provider)
-                        root.refresh()
+                        if (doc.state) {
+                            root.applyProviderAccountState(doc.provider, doc.state)
+                        }
+                        Qt.callLater(root.refresh)
+                        root.syncProxyCliAccountsIfRunning()
                     }
                 } else if (action === "snapshot") {
                     root.accountNotice = "Saved " + pName + " account: " + lbl
-                    root.refresh()
+                    if (doc.state) {
+                        root.applyProviderAccountState(doc.provider, doc.state)
+                    }
+                    Qt.callLater(root.refresh)
+                    root.syncProxyCliAccountsIfRunning()
                 } else if (action === "launch-login") {
                     root.accountNotice = doc.message
-                        ? String(doc.message) + " Refresh once finished."
-                        : "Opened terminal for login. Refresh once finished."
+                        ? String(doc.message) + " Oasis will update automatically."
+                        : "Opened terminal for login — Oasis will update automatically."
+                    root.startAccountWatch(doc.provider)
                 } else if (action === "rename") {
                     root.accountNotice = "Renamed account to " + lbl
-                    root.refresh()
+                    if (doc.state) {
+                        root.applyProviderAccountState(doc.provider, doc.state)
+                    }
+                    Qt.callLater(root.refresh)
                 } else if (action === "remove") {
                     root.accountNotice = "Removed saved " + pName + " account"
-                    root.refresh()
+                    if (doc.state) {
+                        root.applyProviderAccountState(doc.provider, doc.state)
+                    }
+                    Qt.callLater(root.refresh)
+                    root.syncProxyCliAccountsIfRunning()
                 } else {
-                    root.refresh()
+                    Qt.callLater(root.refresh)
                 }
                 noticeTimer.restart()
             } catch (error) {
                 root.accountError = detail.length > 0 ? detail : "invalid account helper output"
             }
+        }
+    }
+
+    // Fast local account-list reader (~20ms, zero network) for instant DOM updates and
+    // automatic detection after interactive terminal sign-ins.
+    Plasma5Support.DataSource {
+        id: accountSyncSource
+        engine: "executable"
+        onNewData: function(sourceName, data) {
+            if (accountSyncSource.connectedSources.indexOf(sourceName) === -1) {
+                return
+            }
+            accountSyncSource.disconnectSource(sourceName)
+            var output = (data.stdout || "").trim()
+            if (output.length === 0) {
+                return
+            }
+            try {
+                var state = JSON.parse(output)
+                if (!state || !state.provider) {
+                    return
+                }
+                var pid = String(state.provider)
+                var prevSig = root.providerAccountSignature(pid)
+                var nextSig = root.accountStateSignature(state.accounts || [])
+                if (prevSig !== nextSig) {
+                    root.applyProviderAccountState(pid, state)
+                }
+                if (root.watchAccountProvider === pid && nextSig !== root.watchAccountBaseline) {
+                    root.watchAccountProvider = ""
+                    root.watchAccountBaseline = ""
+                    root.watchAccountTicks = 0
+                    var pName = F.meta(pid).name
+                    root.accountNotice = state.active_label
+                        ? ("Added & activated " + pName + " → " + String(state.active_label))
+                        : ("Updated " + pName + " accounts")
+                    noticeTimer.restart()
+                    root.clearLimitStateForProvider(pid)
+                    Qt.callLater(root.refresh)
+                    root.syncProxyCliAccountsIfRunning()
+                }
+            } catch (error) {
+                // Ignore transient parse errors during concurrent CLI writes.
+            }
+        }
+    }
+
+    Timer {
+        id: accountWatchTimer
+        interval: 2500
+        repeat: true
+        running: root.watchAccountProvider.length > 0
+        onTriggered: {
+            root.watchAccountTicks += 1
+            if (root.watchAccountTicks > 72) {
+                root.watchAccountProvider = ""
+                root.watchAccountBaseline = ""
+                root.watchAccountTicks = 0
+                return
+            }
+            root.syncProviderAccountsFast(root.watchAccountProvider)
         }
     }
 
@@ -339,6 +432,17 @@ PlasmoidItem {
                 root.proxyError = ""
                 if (action === "status") {
                     root.proxyState = doc
+                    if (root.watchProxyProvider.length > 0) {
+                        var wp = root.watchProxyProvider
+                        var cnt = root.proxyAccountCountFor(doc, wp)
+                        if (cnt > root.watchProxyBaselineCount) {
+                            root.watchProxyProvider = ""
+                            root.watchProxyBaselineCount = -1
+                            root.watchProxyTicks = 0
+                            root.proxyNotice = "Connected new " + F.meta(wp).name + " account in Oasis Proxy"
+                            proxyNoticeTimer.restart()
+                        }
+                    }
                     return
                 }
                 if (action === "import-intel-preview") {
@@ -349,6 +453,18 @@ PlasmoidItem {
                     root.proxyNotice = "Copied Oasis Proxy endpoint (" + String(doc.endpoint || "127.0.0.1") + ")"
                 } else if (action === "copy-tier-endpoint") {
                     root.proxyNotice = "Copied " + String(doc.tier || "") + " tier URL (" + String(doc.endpoint || "127.0.0.1") + ")"
+                } else if (action === "copy-model") {
+                    root.proxyNotice = "Copied model ID (" + String(doc.model || "oasis/auto") + ")"
+                } else if (action === "auto-setup") {
+                    root.proxyNotice = doc.used_intel
+                        ? "Auto-configured all 4 tiers using AI Intel & connected accounts"
+                        : "Auto-configured all 4 tiers from your connected accounts"
+                } else if (action === "sync-cli-accounts") {
+                    root.proxyNotice = (doc.providers && doc.providers.length > 0)
+                        ? ("Synced CLI accounts: " + doc.providers.join(", "))
+                        : "All detected CLI accounts are already up to date"
+                } else if (action === "sync-detected-key") {
+                    root.proxyNotice = "Synced " + F.meta(doc.synced_provider || "").name + " static API key into Oasis Proxy"
                 } else if (action === "copy-client-key") {
                     root.proxyNotice = "Copied Oasis Proxy client API key to clipboard"
                 } else if (action === "rotate-key") {
@@ -372,7 +488,10 @@ PlasmoidItem {
                 } else if (action === "reset") {
                     root.proxyNotice = "Cleared account cooldown"
                 } else if (action === "launch-login") {
-                    root.proxyNotice = doc.message ? String(doc.message) : "Opened isolated Oasis Proxy sign-in terminal"
+                    root.proxyNotice = doc.message
+                        ? String(doc.message) + " Oasis Proxy will update automatically."
+                        : "Opened isolated Oasis Proxy sign-in terminal — will update automatically."
+                    root.startProxyLoginWatch(doc.provider || "")
                 } else if (action === "routing") {
                     root.proxyNotice = "Updated Oasis Proxy routing settings"
                 } else if (action === "provider-default") {
@@ -393,7 +512,7 @@ PlasmoidItem {
                         : String(doc.warning)
                 }
                 proxyNoticeTimer.restart()
-                if (action !== "copy-endpoint" && action !== "copy-tier-endpoint" && action !== "copy-client-key" && action !== "launch-login") {
+                if (action !== "copy-endpoint" && action !== "copy-tier-endpoint" && action !== "copy-model" && action !== "copy-client-key" && action !== "launch-login") {
                     root.refreshProxyStatus(true)
                 }
             } catch (error) {
@@ -418,6 +537,25 @@ PlasmoidItem {
         interval: 5500
         repeat: false
         onTriggered: root.proxyNotice = ""
+    }
+
+    Timer {
+        id: proxyLoginWatchTimer
+        interval: 3000
+        repeat: true
+        running: root.watchProxyProvider.length > 0
+        onTriggered: {
+            root.watchProxyTicks += 1
+            if (root.watchProxyTicks > 60) {
+                root.watchProxyProvider = ""
+                root.watchProxyBaselineCount = -1
+                root.watchProxyTicks = 0
+                return
+            }
+            if (!root.proxyBusy) {
+                root.refreshProxyStatus(true)
+            }
+        }
     }
 
     Timer {
@@ -624,6 +762,164 @@ PlasmoidItem {
 
     function copyProxyTierEndpoint(tier) {
         runProxyCommand("copy-tier-endpoint", "python3 " + shellQuote(root.proxyPath()) + " copy-tier-endpoint --tier=" + shellQuote(tier), false)
+    }
+
+    function copyProxyAutoModel() {
+        runProxyCommand("copy-model", "python3 " + shellQuote(root.proxyPath()) + " copy-model --model=oasis/auto", false)
+    }
+
+    function autoSetupProxy() {
+        runProxyCommand("auto-setup", "python3 " + shellQuote(root.proxyPath()) + " auto-setup", false)
+    }
+
+    function syncProxyCliAccounts() {
+        runProxyCommand("sync-cli-accounts", "python3 " + shellQuote(root.proxyPath()) + " sync-cli-accounts", false)
+    }
+
+    function syncProxyCliAccountsIfRunning() {
+        if (root.proxyState && root.proxyState.health && root.proxyState.health.ready && !root.proxyBusy) {
+            runProxyCommand("sync-cli-accounts", "python3 " + shellQuote(root.proxyPath()) + " sync-cli-accounts", true)
+        }
+    }
+
+    function proxyAccountCountFor(stateDoc, providerId) {
+        if (!stateDoc || !stateDoc.accounts || !providerId) return 0
+        var count = 0
+        for (var i = 0; i < stateDoc.accounts.length; ++i) {
+            if (stateDoc.accounts[i] && String(stateDoc.accounts[i].provider || "") === String(providerId)) {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    function startProxyLoginWatch(providerId) {
+        if (!providerId) return
+        root.watchProxyProvider = String(providerId)
+        root.watchProxyBaselineCount = root.proxyAccountCountFor(root.proxyState, providerId)
+        root.watchProxyTicks = 0
+    }
+
+    function accountStateSignature(accounts) {
+        var list = accounts || []
+        var parts = []
+        for (var i = 0; i < list.length; ++i) {
+            var a = list[i]
+            if (!a) continue
+            parts.push(String(a.id || "") + ":" + String(a.label || "") + ":" + (a.active ? "1" : "0"))
+        }
+        parts.sort()
+        return parts.join("|")
+    }
+
+    function providerAccountSignature(providerId) {
+        var list = root.providers || []
+        for (var i = 0; i < list.length; ++i) {
+            if (list[i] && String(list[i].id || "") === String(providerId)) {
+                return root.accountStateSignature(list[i].accounts || [])
+            }
+        }
+        return ""
+    }
+
+    function applyProviderAccountState(providerId, state) {
+        if (!providerId || !state || !root.payload || !root.payload.providers) {
+            return
+        }
+        var pid = String(providerId)
+        var oldProviders = root.payload.providers
+        var nextProviders = []
+        var changed = false
+
+        for (var i = 0; i < oldProviders.length; ++i) {
+            var p = oldProviders[i]
+            if (!p || String(p.id || "") !== pid) {
+                nextProviders.push(p)
+                continue
+            }
+            changed = true
+            var prevById = {}
+            var oldAccounts = p.accounts || []
+            for (var j = 0; j < oldAccounts.length; ++j) {
+                if (oldAccounts[j] && oldAccounts[j].id) {
+                    prevById[String(oldAccounts[j].id)] = oldAccounts[j]
+                }
+            }
+            var rawAccounts = state.accounts || []
+            var nextAccounts = []
+            for (var k = 0; k < rawAccounts.length; ++k) {
+                var raw = rawAccounts[k]
+                if (!raw) continue
+                var aid = String(raw.id || "")
+                var prev = prevById[aid]
+                var mergedAcc = {
+                    "id": aid,
+                    "label": raw.label || "",
+                    "email": raw.email || null,
+                    "active": !!raw.active,
+                    "source": raw.source || "vault",
+                    "kind": raw.kind || "oauth",
+                    "region": raw.region || null,
+                    "status": prev && prev.status ? prev.status : "ok",
+                    "plan": prev && prev.plan ? prev.plan : null,
+                    "windows": prev && prev.windows ? prev.windows : [],
+                    "error": prev && prev.error ? prev.error : null,
+                    "stale": prev ? !!prev.stale : false
+                }
+                nextAccounts.push(mergedAcc)
+            }
+
+            var updated = {}
+            for (var key in p) {
+                updated[key] = p[key]
+            }
+            updated.supports_accounts = true
+            updated.account = state.active_label || null
+            updated.account_id = state.active_id || null
+            updated.accounts = nextAccounts
+            if (nextAccounts.length > 0 && updated.status === "not_configured") {
+                updated.status = "ok"
+            }
+            if (state.supports_login !== undefined || state.supports_api_key !== undefined) {
+                updated.account_capabilities = {
+                    "supports_login": !!state.supports_login,
+                    "supports_api_key": !!state.supports_api_key,
+                    "api_key_placeholder": state.api_key_placeholder || "",
+                    "regions": state.regions || [],
+                    "login_hint": state.login_hint || ""
+                }
+            }
+            nextProviders.push(updated)
+        }
+
+        if (!changed) {
+            return
+        }
+        var nextPayload = {}
+        for (var pk in root.payload) {
+            nextPayload[pk] = root.payload[pk]
+        }
+        nextPayload.providers = nextProviders
+        root.payload = nextPayload
+    }
+
+    function syncProviderAccountsFast(providerId) {
+        if (!providerId) return
+        var safePath = root.accountsPath().replace(/['\n\r]/g, "")
+        accountSyncSource.connectedSources = []
+        accountSyncSource.connectSource(
+            "python3 '" + safePath + "' list --provider " + shellQuote(String(providerId)))
+    }
+
+    function startAccountWatch(providerId) {
+        if (!providerId) return
+        root.watchAccountProvider = String(providerId)
+        root.watchAccountBaseline = root.providerAccountSignature(providerId)
+        root.watchAccountTicks = 0
+    }
+
+    function syncDetectedProxyKey(providerId) {
+        runProxyCommand("sync-detected-key", "python3 " + shellQuote(root.proxyPath()) + " sync-detected-key --provider=" + shellQuote(providerId), false)
     }
 
     function previewProxyIntelImport() {

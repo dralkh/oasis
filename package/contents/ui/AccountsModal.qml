@@ -19,6 +19,7 @@ ColumnLayout {
     signal backRequested()
     signal refreshRequested()
     signal quitRequested()
+    signal providerSelected(string providerId)
     signal switchAccountRequested(string providerId, string accountId)
     signal snapshotAccountRequested(string providerId, string label)
     signal launchLoginRequested(string providerId, string label)
@@ -226,7 +227,7 @@ ColumnLayout {
                 }
 
                 HoverHandler { id: pillHover }
-                TapHandler { onTapped: modal.selectedProviderId = modelData.id }
+                TapHandler { onTapped: modal.providerSelected(modelData.id) }
             }
         }
     }
@@ -274,9 +275,12 @@ ColumnLayout {
         Layout.fillWidth: true
         Layout.fillHeight: true
         clip: true
+        contentWidth: availableWidth
+        contentHeight: accountsScrollCol.implicitHeight
         QQC2.ScrollBar.horizontal.policy: QQC2.ScrollBar.AlwaysOff
 
         ColumnLayout {
+            id: accountsScrollCol
             width: scroll.availableWidth
             spacing: 8
 
@@ -350,7 +354,9 @@ ColumnLayout {
 
                     ColumnLayout {
                         id: cardCol
-                        anchors.fill: parent
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
                         anchors.margins: 7
                         spacing: 4
 
@@ -621,7 +627,9 @@ ColumnLayout {
 
                 ColumnLayout {
                     id: addCol
-                    anchors.fill: parent
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
                     anchors.margins: 8
                     spacing: 6
 

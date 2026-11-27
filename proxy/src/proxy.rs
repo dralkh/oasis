@@ -615,6 +615,123 @@ fn provider_default_thinking(cfg: &crate::config::Config, acct: &Account) -> Opt
     None
 }
 
+/// Quality-first ranking used by `oasis/auto` when cycling across connected models without manual tier config.
+fn auto_model_priority(model: &str) -> u32 {
+    let m = model.to_ascii_lowercase();
+    const RANKED: &[&str] = &[
+        "claude-fable-5-2",
+        "claude-fable-5-1",
+        "claude-opus-5-5",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "gpt-6-astra",
+        "claude-sonnet-5-5",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "gpt-6.1-sol",
+        "gpt-6-sol",
+        "gpt-5.6-sol",
+        "gpt-5.4",
+        "gpt-5.3-codex",
+        "gemini-3.1-pro",
+        "gemini-2.5-pro",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-2.5-flash",
+        "deepseek-v4-pro",
+        "deepseek-v3.2",
+        "kimi-k3",
+        "grok-4.7",
+        "qwen3-coder-plus",
+        "glm-5",
+        "muse-spark-1.3",
+    ];
+    for (idx, pat) in RANKED.iter().enumerate() {
+        if m == *pat || m.starts_with(pat) {
+            return idx as u32;
+        }
+    }
+    if m.contains("image") || m.contains("video") {
+        return 900;
+    }
+    500
+}
+
+fn resolve_auto_model(
+    app: &Arc<App>,
+    cfg: &crate::config::Config,
+    client_suffix: Option<Reasoning>,
+) -> Result<(String, Option<Reasoning>, Option<Reasoning>), (u16, String)> {
+    // 1. Build ordered failover list: configured tiers (diamond -> gold -> silver -> subagent),
+    //    then provider defaults, then all connected live models ranked by frontier quality.
+    let mut candidates: Vec<(String, Option<Reasoning>)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for tname in ["diamond", "gold", "silver", "subagent"] {
+        if let Some(targets) = cfg.tiers.get(tname) {
+            for target in targets {
+                let raw = target.model.trim();
+                if raw.is_empty() {
+                    continue;
+                }
+                let (tm, inline_suffix) = ir::split_model_suffix(raw);
+                if seen.insert(tm.to_ascii_lowercase()) {
+                    let think = inline_suffix.or_else(|| target.thinking.as_deref().and_then(ir::parse_thinking));
+                    candidates.push((tm, think));
+                }
+            }
+        }
+    }
+
+    for def in cfg.provider_defaults.values() {
+        let raw = def.model.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let (tm, inline_suffix) = ir::split_model_suffix(raw);
+        if seen.insert(tm.to_ascii_lowercase()) {
+            let think = inline_suffix.or_else(|| def.thinking.as_deref().and_then(ir::parse_thinking));
+            candidates.push((tm, think));
+        }
+    }
+
+    let mut live_models: Vec<String> = app
+        .pool
+        .models()
+        .into_iter()
+        .map(|(id, _)| id)
+        .filter(|id| !id.starts_with("oasis/"))
+        .collect();
+    live_models.sort_by(|a, b| auto_model_priority(a).cmp(&auto_model_priority(b)).then_with(|| a.cmp(b)));
+    for lm in live_models {
+        if seen.insert(lm.to_ascii_lowercase()) {
+            candidates.push((lm, None));
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err((
+            404,
+            "No accounts connected in Oasis Proxy yet — open Oasis → Proxy and add an account first.".into(),
+        ));
+    }
+
+    // Pick the first candidate whose provider currently has an available (non-cooling) account.
+    for (tm, think) in &candidates {
+        let (only, routed) = app.pool.route(tm);
+        let canon = app.pool.canonical(&routed, only.as_ref());
+        if matches!(app.pool.pick(&canon, &[], cfg, None, only.as_ref(), &HashMap::new()), Pick::Ok(_, _)) {
+            return Ok((tm.clone(), client_suffix, think.clone()));
+        }
+    }
+
+    // All accounts currently cooling: fall back to the top candidate so normal cooldown retry/429 message applies.
+    let (tm, think) = candidates.remove(0);
+    Ok((tm, client_suffix, think))
+}
+
 fn resolve_tier_or_virtual(
     app: &Arc<App>,
     cfg: &crate::config::Config,
@@ -624,6 +741,14 @@ fn resolve_tier_or_virtual(
     let (base_model, client_suffix) = ir::split_model_suffix(raw_model);
 
     let mut tier_name: Option<String> = call_tier.map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty());
+
+    // Built-in `oasis` / `oasis/auto` (or `/tier/auto/...`) automatically cycles across all connected models.
+    if tier_name.as_deref() == Some("auto")
+        || base_model.eq_ignore_ascii_case("oasis")
+        || base_model.eq_ignore_ascii_case("oasis/auto")
+    {
+        return resolve_auto_model(app, cfg, client_suffix);
+    }
 
     if tier_name.is_none()
         && let Some(rest) = base_model

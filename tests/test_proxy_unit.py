@@ -507,3 +507,111 @@ def test_catalog_models_populated_even_without_connected_accounts(proxy_mod: Any
     assert merged[1] == {"id": "custom-live-model", "provider": "antigravity", "connected": True, "source": "live"}
     # No duplicate (claude-opus-5-5, claude)
     assert sum(1 for m in merged if m["id"] == "claude-opus-5-5" and m["provider"] == "claude") == 1
+
+
+def test_auto_setup_tiers_configures_all_four_tiers_and_provider_defaults(
+    proxy_mod: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = proxy_mod.load_state(create_if_missing=True)
+    assert state is not None
+    monkeypatch.setattr(proxy_mod, "_port_in_use", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        proxy_mod.CliProxyApiRustBackend,
+        "list_models",
+        lambda self, port, key, state=None: (
+            True,
+            [
+                {"id": "claude-opus-5-5", "provider": "claude"},
+                {"id": "gpt-6-astra", "provider": "codex"},
+                {"id": "gemini-3.8-flash-high", "provider": "antigravity"},
+                {"id": "deepseek-v3.2", "provider": "opencodego"},
+            ],
+            None,
+        ),
+    )
+
+    res = proxy_mod.auto_setup_tiers()
+    assert res["ok"] is True
+    assert res["auto_model"] == "oasis/auto"
+    fresh = proxy_mod.load_state(create_if_missing=False)
+    assert fresh is not None
+    assert fresh["tiers"]["diamond"][0]["model"] == "claude-opus-5-5"
+    assert fresh["tiers"]["diamond"][0]["thinking"] == "high"
+    assert fresh["tiers"]["gold"][0]["model"] == "gpt-6-astra"
+    assert fresh["tiers"]["gold"][0]["thinking"] == "medium"
+    assert fresh["tiers"]["silver"][0]["thinking"] == "low"
+    assert fresh["tiers"]["subagent"][0]["thinking"] == "none"
+    assert fresh["provider_defaults"]["claude"]["model"] == "claude-opus-5-5"
+    assert fresh["provider_defaults"]["codex"]["model"] == "gpt-6-astra"
+
+
+def test_sync_cli_accounts_imports_codex_claude_and_opencodego_with_freshness_guard(
+    proxy_mod: Any, isolated_env: dict[str, Path]
+) -> None:
+    import json
+
+    home = isolated_env["home"]
+    (home / ".codex").mkdir(mode=0o700)
+    (home / ".codex" / "auth.json").write_text(
+        json.dumps({"tokens": {"access_token": "tok_cx_1", "refresh_token": "rt_cx_1", "account_id": "acc_1"}}),
+        encoding="utf-8",
+    )
+    (home / ".claude").mkdir(mode=0o700)
+    (home / ".claude" / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "tok_cl_1", "refreshToken": "rt_cl_1", "expiresAt": 1900000000000}}),
+        encoding="utf-8",
+    )
+    oc_dir = home / ".local" / "share" / "opencode"
+    oc_dir.mkdir(parents=True)
+    (oc_dir / "auth.json").write_text(
+        json.dumps({"opencode-go": {"key": "ocg_static_test_key_1234"}}),
+        encoding="utf-8",
+    )
+    import base64
+
+    ag_blob = json.dumps({
+        "id_token_email": "ag-user@example.com",
+        "token": {
+            "access_token": "tok_ag_1",
+            "refresh_token": "rt_ag_1",
+            "expiry": "2099-01-01T00:00:00Z",
+        },
+    })
+    vault_dir = home / ".config" / "oasis" / "accounts"
+    (vault_dir / "secrets" / "antigravity").mkdir(parents=True, exist_ok=True)
+    (vault_dir / "index.json").write_text(
+        json.dumps({"providers": {"antigravity": {"accounts": [{"id": "ag1", "label": "ag-user@example.com"}]}}}),
+        encoding="utf-8",
+    )
+    (vault_dir / "secrets" / "antigravity" / "ag1.json").write_text(
+        json.dumps({"raw": "go-keyring-base64:" + base64.b64encode(ag_blob.encode()).decode()}),
+        encoding="utf-8",
+    )
+
+    res = proxy_mod.sync_cli_accounts(auto_tiers=False)
+    assert res["ok"] is True
+    assert set(res["providers"]) == {"codex", "claude", "antigravity", "opencodego"}
+    assert res["imported"] == 4
+    auth_files = {p.name for p in proxy_mod._auths_dir().glob("*.json")}
+    assert any(n.startswith("codex-cli-") for n in auth_files)
+    assert any(n.startswith("claude-cli-") for n in auth_files)
+    assert any(n.startswith("antigravity-cli-") for n in auth_files)
+    ag_file = next(p for p in proxy_mod._auths_dir().glob("antigravity-cli-*.json"))
+    ag_doc = json.loads(ag_file.read_text(encoding="utf-8"))
+    assert ag_doc["type"] == "antigravity"
+    assert ag_doc["email"] == "ag-user@example.com"
+    assert ag_doc["refresh_token"] == "rt_ag_1"
+    # Never leaks raw tokens in sync summary
+    dumped = json.dumps(res)
+    assert "tok_cx_1" not in dumped and "rt_cl_1" not in dumped and "rt_ag_1" not in dumped and "ocg_static_test_key_1234" not in dumped
+
+    # Freshness guard: a strictly newer expiry in proxy auths must NOT be overwritten by older native cred
+    claude_file = next(p for p in proxy_mod._auths_dir().glob("claude-cli-*.json"))
+    doc = json.loads(claude_file.read_text(encoding="utf-8"))
+    doc["access_token"] = "proxy_newer_tok"
+    doc["expired"] = 2000000000
+    claude_file.write_text(json.dumps(doc), encoding="utf-8")
+
+    proxy_mod.sync_cli_accounts(auto_tiers=False)
+    after = json.loads(claude_file.read_text(encoding="utf-8"))
+    assert after["access_token"] == "proxy_newer_tok"

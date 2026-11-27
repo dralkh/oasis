@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import abc
 import argparse
+import base64
 import fcntl
 import hashlib
 import ipaddress
@@ -34,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 MIN_BACKEND_VERSION = (0, 3, 0)
 PINNED_BACKEND_TAG = "v0.3.2"
 DEFAULT_HOST = "127.0.0.1"
@@ -1593,10 +1594,60 @@ def _systemd_escape_path(value: str) -> str:
     return value.replace("%", "%%")
 
 
+def _antigravity_env_path() -> Path:
+    return _proxy_dir() / "antigravity.env"
+
+
+def _discover_local_antigravity_oauth_client() -> Optional[tuple[str, str]]:
+    """Discover public desktop OAuth client for Antigravity from env or local IDE/CLI (never hardcoded)."""
+    cid = (os.environ.get("OASIS_ANTIGRAVITY_CLIENT_ID") or os.environ.get("ANTIGRAVITY_CLIENT_ID") or "").strip()
+    csec = (os.environ.get("OASIS_ANTIGRAVITY_CLIENT_SECRET") or os.environ.get("ANTIGRAVITY_CLIENT_SECRET") or "").strip()
+    if cid and csec:
+        return cid, csec
+    # Avoid scanning host IDE binaries during isolated unit tests with fake HOME.
+    try:
+        import pwd
+
+        if str(_home().resolve()) != str(Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()):
+            return None
+    except Exception:
+        pass
+    try:
+        helper_dir = str(Path(__file__).resolve().parent)
+        if helper_dir not in sys.path:
+            sys.path.insert(0, helper_dir)
+        import ai_limits  # type: ignore[import-not-found]
+
+        pairs = ai_limits._antigravity_clients()
+        if pairs:
+            return str(pairs[0][0]), str(pairs[0][1])
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_antigravity_env_file() -> Optional[Path]:
+    """Write 0600 EnvironmentFile for Antigravity OAuth refresh when a local client is detected."""
+    pair = _discover_local_antigravity_oauth_client()
+    if not pair:
+        return None
+    cid, csec = pair
+    if any(ch in cid + csec for ch in ("\n", "\r", "\0")):
+        return None
+    env_path = _antigravity_env_path()
+    content = (
+        f"OASIS_ANTIGRAVITY_CLIENT_ID={cid}\n"
+        f"OASIS_ANTIGRAVITY_CLIENT_SECRET={csec}\n"
+    )
+    _write_text_atomic(env_path, content, mode=0o600, private_parent=True)
+    return env_path
+
+
 def _render_systemd_unit(binary_path: str, cfg_path: Path) -> str:
     b_q = _systemd_escape_exec_arg(binary_path)
     c_q = _systemd_escape_exec_arg(str(cfg_path))
     wd = _systemd_escape_path(str(cfg_path.parent))
+    ag_env = _systemd_escape_path(str(cfg_path.parent / "antigravity.env"))
     return (
         "[Unit]\n"
         "Description=Oasis Proxy — Local AI Inference Service\n"
@@ -1606,6 +1657,7 @@ def _render_systemd_unit(binary_path: str, cfg_path: Path) -> str:
         "Type=simple\n"
         f"ExecStart={b_q} --config {c_q}\n"
         f"WorkingDirectory={wd}\n"
+        f"EnvironmentFile=-{ag_env}\n"
         "UMask=0077\n"
         "Restart=on-failure\n"
         "RestartSec=2\n"
@@ -1621,6 +1673,7 @@ def _render_systemd_unit(binary_path: str, cfg_path: Path) -> str:
 
 
 def _install_systemd_unit(binary_path: str, cfg_path: Path) -> Path:
+    _ensure_antigravity_env_file()
     unit_path = _systemd_unit_path()
     _write_text_atomic(unit_path, _render_systemd_unit(binary_path, cfg_path), mode=0o644, private_parent=False)
     subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, timeout=6, check=False)
@@ -1681,6 +1734,10 @@ def _wait_stopped(port: int, pid: Optional[int], timeout: float = 10.0) -> bool:
 
 def _spawn_direct(binary_path: str, cfg_path: Path) -> subprocess.Popen[bytes]:
     env = _enriched_env(strip_proxies=True)
+    ag_pair = _discover_local_antigravity_oauth_client()
+    if ag_pair:
+        env.setdefault("OASIS_ANTIGRAVITY_CLIENT_ID", ag_pair[0])
+        env.setdefault("OASIS_ANTIGRAVITY_CLIENT_SECRET", ag_pair[1])
     log_path = _proxy_dir() / "proxy.log"
     _reject_symlink(log_path)
     try:
@@ -1746,6 +1803,8 @@ def _start_proxy_locked(*, port_override: Optional[int] = None, binary_override:
             "error": f"Port {port} on 127.0.0.1 is already in use by another process (or a proxy with a different key).",
         }
 
+    # Auto-import already signed-in CLI accounts & Oasis vault accounts so Oasis Proxy works out-of-the-box!
+    synced_summary = _sync_cli_accounts_into_proxy_locked(state)
     save_state_and_render(state)
     cfg_path = _config_yaml_path()
 
@@ -1815,12 +1874,21 @@ def _start_proxy_locked(*, port_override: Optional[int] = None, binary_override:
     )
     policy["mode"] = "proxy"
     save_policy(policy)
+
+    # Auto-populate Tier Routing on first start when accounts are connected and no tiers are set yet.
+    if not any((state.get("tiers") or {}).get(t) for t in VALID_TIERS):
+        try:
+            _auto_setup_tiers_locked(state, port=port, backend=backend)
+        except Exception:
+            pass
+
     return {
         "ok": True,
         "managed_by": managed_by,
         "pid": pid,
         "endpoint": f"http://{DEFAULT_HOST}:{port}",
         "version": ready.get("version") or disc.version,
+        "synced_accounts": synced_summary.get("imported", 0),
     }
 
 
@@ -2026,6 +2094,7 @@ def get_status(
         for a in accounts
         if isinstance(a, dict) and not a.get("disabled") and a.get("provider")
     })
+    syncable_static = detect_syncable_static_providers(state, connected_providers=connected_providers)
 
     return {
         "ok": True,
@@ -2036,6 +2105,7 @@ def get_status(
         "openai_base_url": f"http://{DEFAULT_HOST}:{port}/v1",
         "anthropic_base_url": f"http://{DEFAULT_HOST}:{port}",
         "gemini_base_url": f"http://{DEFAULT_HOST}:{port}/v1beta",
+        "default_auto_model": "oasis/auto",
         "port": port,
         "initialized": state is not None,
         "client_key_configured": bool(state and state.get("client_api_key")),
@@ -2070,6 +2140,7 @@ def get_status(
         "tiers": tiers_out,
         "intel_available": intel_available,
         "connected_providers": connected_providers,
+        "syncable_static_providers": syncable_static,
         "accounts": accounts,
         "models": models,
         "catalog_models": catalog_models,
@@ -2825,6 +2896,732 @@ def _copy_to_clipboard(text: str, *, sensitive: bool = False) -> str:
     raise RuntimeError("No clipboard utility found (install wl-clipboard, xclip, or xsel).")
 
 
+def _looks_like_oauth_token(key: str) -> bool:
+    clean = (key or "").strip()
+    return clean.startswith("dca:") or (clean.startswith("eyJ") and clean.count(".") == 2)
+
+
+def _read_local_static_api_key(provider: str) -> Optional[tuple[str, str]]:
+    """Read a non-rotating static API key from a local CLI store when safe.
+
+    Returns (api_key, region) or None. Strictly refuses rotating OAuth tokens.
+    """
+    if provider == "opencodego":
+        # 1. OpenCode SQLite credential table (non-rotating static API key)
+        db_path = _home() / ".local" / "share" / "opencode" / "opencode.db"
+        if db_path.is_file() and not db_path.is_symlink():
+            try:
+                import sqlite3
+
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.5)
+                try:
+                    rows = conn.execute(
+                        "SELECT data FROM credential WHERE provider_id = 'opencode-go' ORDER BY active DESC, updated_at DESC LIMIT 3"
+                    ).fetchall()
+                    for (raw,) in rows:
+                        doc = json.loads(raw) if isinstance(raw, str) else {}
+                        key = str(doc.get("key") or doc.get("apiKey") or doc.get("api_key") or "").strip()
+                        if key and not _looks_like_oauth_token(key):
+                            return key, "international"
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+        # 2. Legacy OpenCode auth.json fallback
+        auth_path = _home() / ".local" / "share" / "opencode" / "auth.json"
+        if auth_path.is_file() and not auth_path.is_symlink():
+            doc = _read_private_json(auth_path) or {}
+            entry = doc.get("opencode-go")
+            if isinstance(entry, dict):
+                key = str(entry.get("key") or entry.get("apiKey") or entry.get("api_key") or "").strip()
+                if key and not _looks_like_oauth_token(key):
+                    return key, "international"
+        return None
+
+    if provider == "qwen":
+        for env_name in ("QWEN_CODING_API_KEY", "DASHSCOPE_API_KEY"):
+            key = os.environ.get(env_name, "").strip()
+            if key and not _looks_like_oauth_token(key):
+                return key, "international"
+        return None
+
+    if provider == "kimi":
+        key = os.environ.get("KIMI_CODE_API_KEY", "").strip()
+        if key and not _looks_like_oauth_token(key):
+            return key, "china"
+        return None
+
+    return None
+
+
+def detect_syncable_static_providers(
+    state: Optional[dict[str, Any]],
+    *,
+    connected_providers: Optional[list[str]] = None,
+) -> list[str]:
+    """Return non-rotating static API-key providers detected locally and not yet synced to proxy."""
+    already = set(connected_providers or [])
+    for entry in (state or {}).get("openai_compatibility") or []:
+        if not isinstance(entry, dict):
+            continue
+        nm = str(entry.get("name") or "").lower()
+        if nm.startswith("opencode"):
+            already.add("opencodego")
+        elif nm.startswith("qwen"):
+            already.add("qwen")
+    for prov_key in ("kimi",):
+        if ((state or {}).get("api_keys") or {}).get(prov_key):
+            already.add(prov_key)
+
+    found: list[str] = []
+    for pid in ("opencodego", "qwen", "kimi"):
+        if pid in already:
+            continue
+        if _read_local_static_api_key(pid) is not None:
+            found.append(pid)
+    return found
+
+
+def sync_detected_static_key(provider: str) -> dict[str, Any]:
+    """Sync a locally detected non-rotating static API key (e.g. OpenCode Go) into Oasis Proxy."""
+    if provider not in ("opencodego", "qwen", "kimi"):
+        raise ValueError(f"auto-sync is only allowed for static API-key providers (opencodego, qwen, kimi); got '{provider}'")
+    found = _read_local_static_api_key(provider)
+    if found is None:
+        cap_name = PROVIDER_CAPABILITIES.get(provider, {}).get("name", provider)
+        raise RuntimeError(f"No local static API key found for {cap_name}.")
+    raw_key, region = found
+    res = sync_static_api_key(provider, raw_key, region=region)
+    res["synced_provider"] = provider
+    return res
+
+
+def _rank_model_for_auto(model_id: str) -> int:
+    low = model_id.lower()
+    ranked = (
+        "claude-fable-5-2",
+        "claude-fable-5-1",
+        "claude-opus-5-5",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "gpt-6-astra",
+        "claude-sonnet-5-5",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "gpt-6.1-sol",
+        "gpt-6-sol",
+        "gpt-5.6-sol",
+        "gpt-5.4",
+        "gpt-5.3-codex",
+        "gemini-3.1-pro",
+        "gemini-2.5-pro",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-2.5-flash",
+        "deepseek-v4-pro",
+        "deepseek-v3.2",
+        "kimi-k3",
+        "grok-4.7",
+        "qwen3-coder-plus",
+        "glm-5",
+        "muse-spark-1.3",
+    )
+    for idx, pat in enumerate(ranked):
+        if low == pat or low.startswith(pat):
+            return idx
+    if "image" in low or "video" in low:
+        return 900
+    return 500
+
+
+def _jwt_claims_unsafe(token: str) -> dict[str, Any]:
+    """Decode JWT payload claims without signature verification (local metadata only)."""
+    import base64
+
+    if not isinstance(token, str) or token.count(".") < 2:
+        return {}
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        obj = json.loads(base64.urlsafe_b64decode(part))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _safe_file_slug(text: str, fallback: str = "default") -> str:
+    slug = re.sub(r"[^a-z0-9._-]+", "-", (text or "").strip().lower()).strip("-._")
+    return slug[:48] if slug else fallback
+
+
+def _epoch_from_any(val: Any) -> int:
+    if isinstance(val, (int, float)) and val > 0:
+        iv = int(val)
+        return iv // 1000 if iv > 10_000_000_000 else iv
+    if isinstance(val, str) and val.strip():
+        s = val.strip()
+        try:
+            from datetime import datetime
+
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return int(dt.timestamp())
+        except Exception:
+            pass
+    return 0
+
+
+def _write_oauth_if_fresher(dest: Path, payload: dict[str, Any]) -> bool:
+    """Write an oasis-proxy auths/*.json file unless an existing copy has a strictly newer expiry."""
+    _ensure_private_dir(dest.parent)
+    new_exp = _epoch_from_any(payload.get("expired"))
+    if dest.is_file() and not dest.is_symlink():
+        existing = _read_private_json(dest)
+        if isinstance(existing, dict):
+            old_exp = _epoch_from_any(existing.get("expired") or existing.get("expires_at"))
+            if old_exp > 0 and (new_exp == 0 or old_exp >= new_exp) and existing.get("access_token"):
+                return False
+    _write_json_atomic(dest, payload, mode=0o600)
+    return True
+
+
+def _secret_tool_lookup(service: str, username: str) -> Optional[str]:
+    """Read-only lookup from GNOME/KDE Secret Service (skipped when HOME is isolated in tests)."""
+    if os.environ.get("OASIS_PROXY_NO_KEYRING") == "1":
+        return None
+    try:
+        import pwd
+
+        if str(_home().resolve()) != str(Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()):
+            return None
+    except Exception:
+        pass
+    tool = shutil.which("secret-tool")
+    if not tool:
+        return None
+    try:
+        res = subprocess.run(
+            [tool, "lookup", "service", service, "username", username],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            check=False,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _parse_antigravity_raw_for_sync(raw: str) -> Optional[dict[str, Any]]:
+    """Parse Antigravity keyring/vault credential blob into OAuth fields for Oasis Proxy."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.startswith("go-keyring-base64:"):
+        try:
+            text = base64.b64decode(text[len("go-keyring-base64:") :]).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+    if text.startswith("Bearer "):
+        tok = text[7:].strip()
+        return {"access_token": tok, "refresh_token": "", "expired": 0, "email": ""} if tok else None
+    try:
+        doc = json.loads(text)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    token_obj = doc.get("token") if isinstance(doc.get("token"), dict) else doc
+    access = str(token_obj.get("access_token") or token_obj.get("accessToken") or "").strip()
+    refresh = str(token_obj.get("refresh_token") or token_obj.get("refreshToken") or "").strip()
+    id_tok = str(token_obj.get("id_token") or doc.get("id_token") or "").strip()
+    exp = _epoch_from_any(token_obj.get("expiry") or token_obj.get("expires_at") or token_obj.get("expiresAt"))
+    email = str(doc.get("id_token_email") or doc.get("email") or "").strip()
+    if not email and id_tok:
+        claims = _jwt_claims_unsafe(id_tok)
+        email = str(claims.get("email") or "").strip()
+
+    # Reuse fresher cached access token from ai_limits.py if refresh fingerprint matches.
+    if refresh:
+        try:
+            cache_file = Path(os.environ.get("XDG_CACHE_HOME") or (_home() / ".cache")) / "ai-limits" / "antigravity.json"
+            cdoc = _read_private_json(cache_file) if cache_file.is_file() and not cache_file.is_symlink() else None
+            if isinstance(cdoc, dict):
+                rf_fp = hashlib.sha256(refresh.encode()).hexdigest()
+                c_exp = _epoch_from_any(cdoc.get("expires_at"))
+                c_acc = str(cdoc.get("access_token") or "").strip()
+                if c_acc and cdoc.get("refresh_fingerprint") == rf_fp and c_exp > exp:
+                    access = c_acc
+                    exp = c_exp
+        except Exception:
+            pass
+
+    if not access and not refresh:
+        return None
+    return {
+        "access_token": access,
+        "refresh_token": refresh,
+        "expired": exp,
+        "email": email,
+    }
+
+
+def _collect_vault_snapshots(provider: str) -> list[tuple[str, dict[str, Any]]]:
+    """Read saved account snapshots for `provider` from ~/.config/oasis/accounts (read-only)."""
+    vault_dir = _oasis_dir() / "accounts"
+    index_path = vault_dir / "index.json"
+    secrets_dir = vault_dir / "secrets"
+    if not index_path.is_file() or index_path.is_symlink():
+        return []
+    idx = _read_private_json(index_path)
+    if not isinstance(idx, dict):
+        return []
+    prov_entry = (idx.get("providers") or {}).get(provider)
+    if not isinstance(prov_entry, dict):
+        return []
+    out: list[tuple[str, dict[str, Any]]] = []
+    for acc in prov_entry.get("accounts") or []:
+        if not isinstance(acc, dict):
+            continue
+        aid = str(acc.get("id") or "").strip()
+        label = str(acc.get("label") or aid or provider).strip()
+        if not aid or "/" in aid or "\\" in aid or ".." in aid:
+            continue
+        sec_path = secrets_dir / provider / f"{aid}.json"
+        if not sec_path.is_file() or sec_path.is_symlink():
+            continue
+        snap = _read_private_json(sec_path)
+        if isinstance(snap, dict):
+            out.append((label, snap))
+    return out
+
+
+def _sync_cli_accounts_into_proxy_locked(state: dict[str, Any]) -> dict[str, Any]:
+    """Import already signed-in local CLI credentials & Oasis Accounts vault snapshots into Oasis Proxy.
+
+    Read-only on native CLI files; writes 0600 auths/*.json and static compat entries.
+    Never downgrades an existing proxy-refreshed token that has a newer expiry.
+    """
+    auths_dir = _auths_dir()
+    _ensure_private_dir(auths_dir)
+    imported_providers: list[str] = []
+    imported_count = 0
+    seen_codex_keys: set[str] = set()
+    seen_claude_keys: set[str] = set()
+
+    # 1. Codex: active ~/.codex/auth.json + saved vault snapshots
+    codex_sources: list[tuple[str, dict[str, Any]]] = []
+    codex_live = _home() / ".codex" / "auth.json"
+    if codex_live.is_file() and not codex_live.is_symlink():
+        doc = _read_private_json(codex_live)
+        if isinstance(doc, dict):
+            codex_sources.append(("active", doc))
+    codex_sources.extend(_collect_vault_snapshots("codex"))
+
+    for label, doc in codex_sources:
+        # Vault snapshots may wrap the auth.json dict under "data" or "raw" or directly contain "tokens"
+        raw_doc = doc.get("data") if isinstance(doc.get("data"), dict) else doc
+        tokens = raw_doc.get("tokens") if isinstance(raw_doc.get("tokens"), dict) else raw_doc
+        access = str(tokens.get("access_token") or "").strip()
+        refresh = str(tokens.get("refresh_token") or "").strip()
+        id_tok = str(tokens.get("id_token") or "").strip()
+        if not access and not refresh:
+            continue
+        claims = _jwt_claims_unsafe(id_tok) or _jwt_claims_unsafe(access)
+        email = str(claims.get("email") or ("" if label == "active" else label) or "codex-cli").strip()
+        acc_id = str(
+            tokens.get("account_id")
+            or (claims.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id")
+            or ""
+        ).strip()
+        exp = _epoch_from_any(claims.get("exp"))
+        dedup_key = (acc_id or email or access[:20]).lower()
+        if dedup_key in seen_codex_keys:
+            continue
+        seen_codex_keys.add(dedup_key)
+        slug = _safe_file_slug(email or acc_id, "codex")
+        dest = auths_dir / f"codex-cli-{slug}.json"
+        payload: dict[str, Any] = {
+            "type": "codex",
+            "access_token": access,
+            "refresh_token": refresh,
+            "email": email,
+            "source": "oasis_cli_sync",
+        }
+        if id_tok:
+            payload["id_token"] = id_tok
+        if acc_id:
+            payload["account_id"] = acc_id
+        if exp > 0:
+            payload["expired"] = exp
+        if _write_oauth_if_fresher(dest, payload):
+            imported_count += 1
+        if "codex" not in imported_providers:
+            imported_providers.append("codex")
+
+    # 2. Claude: active ~/.claude/.credentials.json + saved vault snapshots
+    claude_sources: list[tuple[str, dict[str, Any]]] = []
+    claude_live = _home() / ".claude" / ".credentials.json"
+    if claude_live.is_file() and not claude_live.is_symlink():
+        doc = _read_private_json(claude_live)
+        if isinstance(doc, dict):
+            claude_sources.append(("active", doc))
+    claude_sources.extend(_collect_vault_snapshots("claude"))
+
+    for label, doc in claude_sources:
+        raw_doc = doc.get("data") if isinstance(doc.get("data"), dict) else doc
+        oauth_obj = raw_doc.get("claudeAiOauth") if isinstance(raw_doc.get("claudeAiOauth"), dict) else raw_doc
+        access = str(oauth_obj.get("accessToken") or oauth_obj.get("access_token") or "").strip()
+        refresh = str(oauth_obj.get("refreshToken") or oauth_obj.get("refresh_token") or "").strip()
+        if not access and not refresh:
+            continue
+        exp = _epoch_from_any(oauth_obj.get("expiresAt") or oauth_obj.get("expires_at") or oauth_obj.get("expired"))
+        email = str(
+            oauth_obj.get("email")
+            or raw_doc.get("email")
+            or ("" if label == "active" else label)
+            or "claude-cli"
+        ).strip()
+        dedup_key = (refresh[:24] if refresh else access[:24])
+        if dedup_key in seen_claude_keys:
+            continue
+        seen_claude_keys.add(dedup_key)
+        slug = _safe_file_slug(email, "claude")
+        dest = auths_dir / f"claude-cli-{slug}.json"
+        payload = {
+            "type": "claude",
+            "access_token": access,
+            "refresh_token": refresh,
+            "email": email,
+            "source": "oasis_cli_sync",
+        }
+        if exp > 0:
+            payload["expired"] = exp
+        if _write_oauth_if_fresher(dest, payload):
+            imported_count += 1
+        if "claude" not in imported_providers:
+            imported_providers.append("claude")
+
+    # 3. Antigravity (Google Cloud Code): Secret Service live login + Oasis Accounts vault snapshots
+    ag_sources: list[tuple[str, str]] = []
+    ag_live_raw = _secret_tool_lookup("gemini", "antigravity")
+    if ag_live_raw:
+        ag_sources.append(("active", ag_live_raw))
+    for label, snap in _collect_vault_snapshots("antigravity"):
+        raw = snap.get("raw") if isinstance(snap.get("raw"), str) else ""
+        if raw:
+            ag_sources.append((label, raw))
+
+    seen_ag_keys: set[str] = set()
+    for label, raw in ag_sources:
+        parsed = _parse_antigravity_raw_for_sync(raw)
+        if not parsed:
+            continue
+        access = parsed["access_token"]
+        refresh = parsed["refresh_token"]
+        exp = parsed["expired"]
+        email = parsed["email"] or ("" if label == "active" else label) or "antigravity-cli"
+        dedup_key = (email.lower() if "@" in email else "") or (refresh[:24] if refresh else access[:24])
+        if dedup_key in seen_ag_keys:
+            continue
+        seen_ag_keys.add(dedup_key)
+        slug = _safe_file_slug(email, "antigravity")
+        dest = auths_dir / f"antigravity-cli-{slug}.json"
+        payload = {
+            "type": "antigravity",
+            "access_token": access,
+            "refresh_token": refresh,
+            "email": email,
+            "source": "oasis_cli_sync",
+        }
+        if exp > 0:
+            payload["expired"] = exp
+        if _write_oauth_if_fresher(dest, payload):
+            imported_count += 1
+        if "antigravity" not in imported_providers:
+            imported_providers.append("antigravity")
+    if "antigravity" in imported_providers:
+        _ensure_antigravity_env_file()
+
+    # 4. Muse (Meta): ~/.config/muse/auth.json + saved vault snapshots
+    muse_sources: list[tuple[str, dict[str, Any]]] = []
+    muse_live = Path(os.environ.get("MUSE_AUTH_PATH") or (_home() / ".config" / "muse" / "auth.json"))
+    if muse_live.is_file() and not muse_live.is_symlink():
+        mdoc = _read_private_json(muse_live)
+        if isinstance(mdoc, dict):
+            muse_sources.append(("active", {"auth": mdoc}))
+    muse_sources.extend(_collect_vault_snapshots("muse"))
+    seen_muse_keys: set[str] = set()
+    for label, snap in muse_sources:
+        auth = snap.get("auth") if isinstance(snap.get("auth"), dict) else snap
+        meta = ((auth.get("providers") or {}).get("meta") if isinstance(auth.get("providers"), dict) else {}) or {}
+        tok = str(meta.get("access_token") or "").strip()
+        if not tok or tok.startswith("dca:"):
+            continue
+        email = str(meta.get("email") or meta.get("user") or ("" if label == "active" else label) or "muse-cli").strip()
+        dedup_key = tok[:24]
+        if dedup_key in seen_muse_keys:
+            continue
+        seen_muse_keys.add(dedup_key)
+        dest = auths_dir / f"meta-cli-{_safe_file_slug(email, 'muse')}.json"
+        payload = {
+            "type": "meta",
+            "api_key": tok,
+            "access_token": tok,
+            "email": email,
+            "source": "oasis_cli_sync",
+        }
+        if _write_oauth_if_fresher(dest, payload):
+            imported_count += 1
+        if "muse" not in imported_providers:
+            imported_providers.append("muse")
+
+    # 5. Grok: active ~/.grok/auth.json
+    grok_live = _home() / ".grok" / "auth.json"
+    if grok_live.is_file() and not grok_live.is_symlink():
+        gdoc = _read_private_json(grok_live)
+        if isinstance(gdoc, dict):
+            access = str(gdoc.get("access_token") or gdoc.get("accessToken") or "").strip()
+            refresh = str(gdoc.get("refresh_token") or gdoc.get("refreshToken") or "").strip()
+            if access or refresh:
+                exp = _epoch_from_any(gdoc.get("expires_at") or gdoc.get("expiresAt"))
+                email = str(gdoc.get("email") or "grok-cli").strip()
+                dest = auths_dir / f"xai-cli-{_safe_file_slug(email, 'grok')}.json"
+                payload = {
+                    "type": "xai",
+                    "access_token": access,
+                    "refresh_token": refresh,
+                    "email": email,
+                    "source": "oasis_cli_sync",
+                }
+                if exp > 0:
+                    payload["expired"] = exp
+                if _write_oauth_if_fresher(dest, payload):
+                    imported_count += 1
+                if "grok" not in imported_providers:
+                    imported_providers.append("grok")
+
+    # 4. Non-rotating static API keys (OpenCode Go, Qwen, Kimi) directly into state
+    for pid in detect_syncable_static_providers(state):
+        found = _read_local_static_api_key(pid)
+        if not found:
+            continue
+        raw_key, region = found
+        try:
+            if pid == "opencodego":
+                valid_models = [m for m in OPENCODEGO_DEFAULT_CHAT_MODELS if m.lower().startswith(OPENCODEGO_CHAT_PREFIXES)]
+                compat = [c for c in (state.get("openai_compatibility") or []) if c.get("name") != "opencode-go"]
+                compat.append({
+                    "name": "opencode-go",
+                    "base_url": "https://opencode.ai/zen/go/v1",
+                    "api_keys": [raw_key],
+                    "models": [{"name": m} for m in valid_models],
+                })
+                state["openai_compatibility"] = compat
+                imported_count += 1
+                if "opencodego" not in imported_providers:
+                    imported_providers.append("opencodego")
+            elif pid == "qwen":
+                is_coding = raw_key.startswith("sk-sp-")
+                base_map = QWEN_CODING_BASES if is_coding else QWEN_API_BASES
+                base = base_map.get(region, base_map["international"])
+                gname = f"qwen-{'coding' if is_coding else 'api'}-{region}"
+                compat = [c for c in (state.get("openai_compatibility") or []) if not str(c.get("name") or "").startswith("qwen-")]
+                compat.append({
+                    "name": gname,
+                    "base_url": base,
+                    "api_keys": [raw_key],
+                    "models": [{"name": m} for m in QWEN_DEFAULT_MODELS],
+                })
+                state["openai_compatibility"] = compat
+                imported_count += 1
+                if "qwen" not in imported_providers:
+                    imported_providers.append("qwen")
+            elif pid == "kimi":
+                base = KIMI_API_BASES.get(region, KIMI_API_BASES["china"])
+                state.setdefault("api_keys", {})["kimi"] = [{"api_key": raw_key, "label": "Kimi CLI", "base_url": base}]
+                imported_count += 1
+                if "kimi" not in imported_providers:
+                    imported_providers.append("kimi")
+        except Exception:
+            pass
+
+    return {"imported": imported_count, "providers": imported_providers}
+
+
+def _auto_setup_tiers_locked(
+    state: dict[str, Any],
+    *,
+    port: int,
+    backend: ProxyBackend,
+) -> dict[str, Any]:
+    """Populate Diamond/Gold/Silver/Subagent + provider defaults from live connected models (caller holds lock)."""
+    live_models: list[dict[str, Any]] = []
+    if _port_in_use(DEFAULT_HOST, port):
+        for _ in range(5):
+            ok_m, mods, _ = backend.list_models(port, state["management_key"], state=state)
+            if ok_m and mods:
+                live_models = [m for m in mods if not str(m.get("id") or "").startswith("oasis/")]
+                if live_models:
+                    break
+            time.sleep(0.25)
+
+    if not live_models:
+        raise RuntimeError(
+            "No connected proxy accounts yet. Sign into a CLI (or click Sync Accounts) first."
+        )
+
+    proposed: dict[str, list[dict[str, str]]] = {}
+    used_intel = False
+    intel_path = _intel_cache_path()
+    if intel_path.is_file():
+        try:
+            doc = _read_private_json(intel_path)
+            if isinstance(doc, dict) and isinstance(doc.get("model_tiers"), dict):
+                mt = doc["model_tiers"]
+                main_list = mt.get("main_agent") if isinstance(mt.get("main_agent"), list) else []
+                sub_list = mt.get("subagent") if isinstance(mt.get("subagent"), list) else []
+                buckets = {
+                    "diamond": [e for e in main_list if isinstance(e, dict) and str(e.get("tier") or "").strip().lower() == "diamond"],
+                    "gold": [e for e in main_list if isinstance(e, dict) and str(e.get("tier") or "").strip().lower() == "gold"],
+                    "silver": [e for e in main_list if isinstance(e, dict) and str(e.get("tier") or "").strip().lower() == "silver"],
+                    "subagent": [e for e in sub_list if isinstance(e, dict)],
+                }
+                for tname in VALID_TIERS:
+                    matched_targets: list[dict[str, str]] = []
+                    seen_m: set[str] = set()
+                    for entry in buckets.get(tname) or []:
+                        raw_m = str(entry.get("model") or "").strip()
+                        raw_p = str(entry.get("provider") or "").strip()
+                        if not raw_m:
+                            continue
+                        matched = _match_intel_model_to_live(raw_m, raw_p, live_models)
+                        if matched:
+                            mid = str(matched["id"])
+                            if mid not in seen_m:
+                                seen_m.add(mid)
+                                matched_targets.append({
+                                    "model": mid,
+                                    "thinking": _default_thinking_for_intel(tname, entry),
+                                    "provider": str(matched.get("provider") or ""),
+                                })
+                    if matched_targets:
+                        proposed[tname] = matched_targets[:3]
+                        used_intel = True
+        except Exception:
+            pass
+
+    ranked_live = sorted(live_models, key=lambda m: (_rank_model_for_auto(str(m.get("id") or "")), str(m.get("id") or "")))
+    fast_live = sorted(
+        live_models,
+        key=lambda m: (
+            0 if any(k in str(m.get("id") or "").lower() for k in ("flash", "haiku", "mini", "lite", "terra", "luna", "deepseek", "glm")) else 1,
+            _rank_model_for_auto(str(m.get("id") or "")),
+        ),
+    )
+
+    def _pick_chain(source_list: list[dict[str, Any]], thinking: str, offset: int = 0) -> list[dict[str, str]]:
+        chosen: list[dict[str, str]] = []
+        seen_ids: set[str] = set()
+        seen_provs: set[str] = set()
+        ordered = source_list[offset:] + source_list[:offset]
+        for m in ordered:
+            mid = str(m.get("id") or "")
+            prov = str(m.get("provider") or "")
+            if not mid or mid in seen_ids or "image" in mid.lower() or "video" in mid.lower():
+                continue
+            if prov and prov in seen_provs and len(chosen) < 2:
+                continue
+            seen_ids.add(mid)
+            if prov:
+                seen_provs.add(prov)
+            chosen.append({"model": mid, "thinking": thinking, "provider": prov})
+            if len(chosen) >= 3:
+                break
+        if not chosen and source_list:
+            m0 = source_list[0]
+            chosen.append({"model": str(m0["id"]), "thinking": thinking, "provider": str(m0.get("provider") or "")})
+        return chosen
+
+    if "diamond" not in proposed:
+        proposed["diamond"] = _pick_chain(ranked_live, "high", offset=0)
+    if "gold" not in proposed:
+        proposed["gold"] = _pick_chain(ranked_live, "medium", offset=1 if len(ranked_live) > 1 else 0)
+    if "silver" not in proposed:
+        proposed["silver"] = _pick_chain(fast_live, "low", offset=0)
+    if "subagent" not in proposed:
+        proposed["subagent"] = _pick_chain(fast_live, "none", offset=0)
+
+    tiers_map = state.setdefault("tiers", {})
+    for tname in VALID_TIERS:
+        if proposed.get(tname):
+            tiers_map[tname] = proposed[tname]
+    pdefs = state.setdefault("provider_defaults", {})
+    by_prov: dict[str, list[dict[str, Any]]] = {}
+    for m in ranked_live:
+        p = str(m.get("provider") or "")
+        if p in PROVIDER_CAPABILITIES:
+            by_prov.setdefault(p, []).append(m)
+    for p, mlist in by_prov.items():
+        cur = pdefs.get(p) if isinstance(pdefs.get(p), dict) else {}
+        if not str(cur.get("model") or "").strip():
+            pdefs[p] = {"model": str(mlist[0]["id"]), "thinking": str(cur.get("thinking") or "auto")}
+    save_state_and_render(state)
+    return {"used_intel": used_intel, "tiers": proposed}
+
+
+def sync_cli_accounts(*, auto_tiers: bool = True) -> dict[str, Any]:
+    """Sync all already signed-in CLI accounts & Oasis vault accounts into Oasis Proxy."""
+    with _control_lock():
+        state = load_state(create_if_missing=True)
+        assert state is not None
+        summary = _sync_cli_accounts_into_proxy_locked(state)
+        save_state_and_render(state)
+        tiers_configured = False
+        port = _validate_port(state.get("port") or DEFAULT_PORT)
+        if auto_tiers and _port_in_use(DEFAULT_HOST, port) and not any((state.get("tiers") or {}).get(t) for t in VALID_TIERS):
+            backend = get_backend(state.get("backend_id") or "cliproxyapi-rust")
+            try:
+                _auto_setup_tiers_locked(state, port=port, backend=backend)
+                tiers_configured = True
+            except Exception:
+                pass
+        return {
+            "ok": True,
+            "imported": summary["imported"],
+            "providers": summary["providers"],
+            "tiers_configured": tiers_configured,
+        }
+
+
+def auto_setup_tiers() -> dict[str, Any]:
+    """Automatically sync CLI accounts and configure all 4 tiers & provider defaults."""
+    with _control_lock():
+        state = load_state(create_if_missing=True)
+        assert state is not None
+        summary = _sync_cli_accounts_into_proxy_locked(state)
+        save_state_and_render(state)
+        port = _validate_port(state.get("port") or DEFAULT_PORT)
+        backend = get_backend(state.get("backend_id") or "cliproxyapi-rust")
+        res = _auto_setup_tiers_locked(state, port=port, backend=backend)
+        return {
+            "ok": True,
+            "used_intel": res["used_intel"],
+            "synced_providers": summary["providers"],
+            "tiers": res["tiers"],
+            "auto_model": "oasis/auto",
+        }
+
+
+def copy_model_id(model: str = "oasis/auto") -> dict[str, Any]:
+    clean = _validate_model_id(model)
+    tool = _copy_to_clipboard(clean, sensitive=False)
+    return {"ok": True, "copied": "model", "model": clean, "tool": tool}
+
+
 def copy_endpoint() -> dict[str, Any]:
     with _control_lock():
         state = load_state(create_if_missing=True)
@@ -2919,9 +3716,15 @@ def run_proxy_login_interactive(provider: str) -> int:
     print(f"=== Oasis Proxy: Isolated {cap['name']} Sign-In ===")
     print(f"Auth dir: {_auths_dir()} (isolated from native CLI credentials)")
     print()
+    run_env = _enriched_env(strip_proxies=True)
+    if provider == "antigravity":
+        ag_pair = _discover_local_antigravity_oauth_client()
+        if ag_pair:
+            run_env.setdefault("OASIS_ANTIGRAVITY_CLIENT_ID", ag_pair[0])
+            run_env.setdefault("OASIS_ANTIGRAVITY_CLIENT_SECRET", ag_pair[1])
     rc = subprocess.run(
         [disc.binary_path, "--config", str(_config_yaml_path()), "login", backend_prov],
-        env=_enriched_env(strip_proxies=True),
+        env=run_env,
         cwd=str(_proxy_dir()),
         check=False,
     ).returncode
@@ -3254,6 +4057,15 @@ def main(argv: list[str]) -> int:
     p_intel = sub.add_parser("import-intel", help="Preview or apply tier routing from cached Oasis AI Intel rankings")
     p_intel.add_argument("--apply", action="store_true")
 
+    sub.add_parser("auto-setup", help="Automatically configure all tiers & provider defaults from connected accounts")
+    sub.add_parser("sync-cli-accounts", help="Sync already signed-in local CLI & Oasis Accounts logins into Oasis Proxy")
+
+    p_sync_det = sub.add_parser("sync-detected-key", help="Sync a locally detected non-rotating static API key (opencodego/qwen/kimi)")
+    p_sync_det.add_argument("--provider", required=True, choices=("opencodego", "qwen", "kimi"))
+
+    p_copy_m = sub.add_parser("copy-model", help="Copy a virtual or concrete model ID (default: oasis/auto) to clipboard")
+    p_copy_m.add_argument("--model", default="oasis/auto")
+
     p_inst = sub.add_parser("install-backend", help="Install a verified local cliproxyapi-rust binary or .tar.gz")
     p_inst.add_argument("--from-file", required=True)
     p_inst.add_argument("--sha256", default="")
@@ -3372,6 +4184,14 @@ def main(argv: list[str]) -> int:
             res = copy_tier_endpoint(args.tier)
         elif args.command == "import-intel":
             res = import_intel_tiers(apply=args.apply)
+        elif args.command == "auto-setup":
+            res = auto_setup_tiers()
+        elif args.command == "sync-cli-accounts":
+            res = sync_cli_accounts()
+        elif args.command == "sync-detected-key":
+            res = sync_detected_static_key(args.provider)
+        elif args.command == "copy-model":
+            res = copy_model_id(args.model)
         elif args.command == "install-backend":
             res = install_backend_from_file(
                 args.from_file,

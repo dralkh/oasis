@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 UA = f"ai-limits-kde/{VERSION}"
 
 HOME = Path.home()

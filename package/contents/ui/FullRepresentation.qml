@@ -44,6 +44,7 @@ Item {
     signal addApiKeyPromptRequested(string providerId, string label, string region)
     signal renameAccountRequested(string providerId, string accountId, string newLabel)
     signal removeAccountRequested(string providerId, string accountId)
+    signal accountsSyncRequested(string providerId)
     signal clearAccountMessagesRequested()
     signal proxyStatusRequested()
     signal proxyModeRequested(string mode)
@@ -62,6 +63,10 @@ Item {
     signal proxyProviderDefaultRequested(string providerId, string model, string thinking)
     signal proxySetTierRequested(string tier, string model, string thinking, bool clear)
     signal proxyCopyTierEndpointRequested(string tier)
+    signal proxyCopyAutoModelRequested()
+    signal proxyAutoSetupRequested()
+    signal proxySyncCliAccountsRequested()
+    signal proxySyncDetectedKeyRequested(string providerId)
     signal proxyImportIntelPreviewRequested()
     signal proxyImportIntelApplyRequested()
     signal proxyClearIntelPreviewRequested()
@@ -74,6 +79,7 @@ Item {
         full.proxyOpen = false
         full.accountsOpen = true
         full.clearAccountMessagesRequested()
+        full.accountsSyncRequested(full.accountsProviderId)
     }
 
     function openProxy() {
@@ -174,6 +180,10 @@ Item {
         onProviderDefaultChanged: function(p, m, t) { full.proxyProviderDefaultRequested(p, m, t) }
         onSetTierRequested: function(t, m, th, c) { full.proxySetTierRequested(t, m, th, c) }
         onCopyTierEndpointRequested: function(t) { full.proxyCopyTierEndpointRequested(t) }
+        onCopyAutoModelRequested: full.proxyCopyAutoModelRequested()
+        onAutoSetupRequested: full.proxyAutoSetupRequested()
+        onSyncCliAccountsRequested: full.proxySyncCliAccountsRequested()
+        onSyncDetectedKeyRequested: function(p) { full.proxySyncDetectedKeyRequested(p) }
         onImportIntelPreviewRequested: full.proxyImportIntelPreviewRequested()
         onImportIntelApplyRequested: full.proxyImportIntelApplyRequested()
         onClearIntelPreviewRequested: full.proxyClearIntelPreviewRequested()
@@ -208,7 +218,10 @@ Item {
         busy: full.accountBusy || full.busy
         errorText: full.accountError
         noticeText: full.accountNotice
-        onSelectedProviderIdChanged: full.accountsProviderId = selectedProviderId
+        onProviderSelected: function(p) {
+            full.accountsProviderId = p
+            full.accountsSyncRequested(p)
+        }
         onBackRequested: full.accountsOpen = false
         onRefreshRequested: full.refreshRequested()
         onQuitRequested: full.quitRequested()
